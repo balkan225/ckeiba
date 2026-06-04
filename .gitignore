@@ -1,0 +1,6 @@
+# すべてを無視
+*
+
+# report.html だけを許可
+!report.html
+!.gitignore
