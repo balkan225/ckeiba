@@ -1,8 +1,42 @@
-# すべてを無視
+# デフォルトで全て無視
 *
 
-# 許可するファイル
-!report.html
+# === 許可するファイル ===
 !.gitignore
+
+# ドキュメント
 !SPEC.md
 !SETUP.md
+
+# 公開レポート（GitHub Pages）
+!report.html
+
+# ソースコード（バックアップ）
+!training_analyzer.py
+!config.py.example
+!update_all.ps1
+!update_quick.ps1
+!run_pckeiba_update.ps1
+!inspect_pckeiba.ps1
+
+# サブプロジェクト
+!cushion/
+!cushion/*.py
+
+# jvlink はコアファイルのみ許可（_始まりの開発スクラッチは除外＝サービスキー含むため）
+!jvlink/
+!jvlink/collector.py
+!jvlink/odds_db.py
+!jvlink/parser.py
+!jvlink/show_odds.py
+!jvlink/visualize.py
+!jvlink/test_parser.py
+
+# === 明示的に除外（秘密情報・生成物） ===
+config.py
+jvlink/_*.py
+*.log
+*.db
+__pycache__/
+cushion/__pycache__/
+jvlink/__pycache__/

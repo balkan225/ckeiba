@@ -1,0 +1,36 @@
+# config.py のテンプレート。
+# 実運用では本ファイルを config.py にコピーし、各値を環境に合わせて設定すること。
+# config.py は .gitignore 対象（パスワードを含むためコミット禁止）。
+
+# PostgreSQL接続設定（JRA-VANデータ / PC-KEIBA DATABASE管理）
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 5432,
+    "database": "pckeiba",
+    "user": "postgres",
+    "password": "＜パスワードを設定＞",
+}
+
+# オッズ時系列DB（keibadata / JvLinkToImporter管理）
+ODDS_DB_CONFIG = {
+    "host": "localhost",
+    "port": 5432,
+    "database": "keibadata",
+    "user": "postgres",
+    "password": "＜パスワードを設定＞",
+}
+
+# 対象期間: 今日から何日後までのレースを対象にするか
+DAYS_AHEAD = 7
+
+# 出走馬に対して取得する調教の最大日数（直近N日以内の最新坂路調教）
+TRAINING_DAYS_BACK = 21
+
+# データソース設定
+# "auto" = データの揃い具合に応じて自動選択
+# "tk"   = 特別登録のみ（火曜）
+# "se"   = 出馬表優先（木曜以降）
+DATA_SOURCE = "auto"
+
+# レポート閲覧パスワード（HTML上のログイン画面用）
+VIEW_PASSWORD = "＜閲覧パスワードを設定＞"
