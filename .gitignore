@@ -1,6 +1,8 @@
 # すべてを無視
 *
 
-# report.html だけを許可
+# 許可するファイル
 !report.html
 !.gitignore
+!SPEC.md
+!SETUP.md
