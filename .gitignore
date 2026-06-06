@@ -31,6 +31,7 @@
 !jvlink/show_odds.py
 !jvlink/visualize.py
 !jvlink/test_parser.py
+!jvlink/fetch_weight_jvlink.py
 
 # === 明示的に除外（秘密情報・生成物） ===
 config.py

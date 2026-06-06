@@ -40,10 +40,19 @@ C:\Users\balka\Desktop\Ckeiba\
 │
 └── jvlink\                 オッズ取得サブプロジェクト（別途運用）
     ├── odds_db.py          ★keibadata DBからオッズ取得
+    ├── fetch_weight_jvlink.py ★JV-Linkから馬体重を直接取得（32bit Python専用）
     ├── show_odds.py        オッズ確認CLI
     ├── collector.py / parser.py / visualize.py
     └── （_test_*, _debug_* 等は開発用）
 ```
+
+### 馬体重のフォールバック取得（重要）
+当日馬体重は通常 keibadata.umagoto_race_joho（JvLinkImporter経由）から取得するが、
+JvLinkImporterが停止すると空になる。その場合 `training_analyzer.fetch_live_weight()` が
+**32bit Pythonで `jvlink/fetch_weight_jvlink.py` を subprocess 起動**し、
+JV-Link を直接叩いて（`JVRTOpen("0B12")` → SEレコード）馬体重を補完、keibadataにも書き戻す。
+- JV-Link COMは32bit専用 → `C:\...\Python314-32\python.exe`（`_PY32_PATH`）を使用
+- SEレコード(555B)の馬体重位置: 馬番=29, 血統登録=31, 馬体重=325, 増減符号=328, 増減差=329
 
 ---
 
