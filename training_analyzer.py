@@ -1370,10 +1370,37 @@ def _pw_hash(pw: str) -> str:
     return format(h & 0xFFFFFFFF, 'x')
 
 
+def _cv_label(cv) -> str:
+    """クッション値 → 硬さラベル"""
+    if cv is None:
+        return ""
+    if cv >= 10.5:  return "硬め"
+    if cv >= 9.5:   return "やや硬め"
+    if cv >= 8.5:   return "やや柔"
+    return "柔らかめ"
+
+
 def generate_html(results: list[dict], output_path: str = "report.html", data_source: str = "tk") -> None:
     today = date.today()
     source_disp = _SOURCE_DISP.get(data_source, data_source)
     _pw_hash_val = _pw_hash(_PW)
+
+    # 当日のクッション値を競馬場名→CVで取得（当日情報ヘッダー用）
+    today_cv_map: dict[str, float] = {}
+    try:
+        _conn = psycopg2.connect(**cfg.DB_CONFIG)
+        with _conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as _cur:
+            _cur.execute(
+                "SELECT racecourse, cushion_value FROM cushion_values "
+                "WHERE measured_date::text = %s",
+                [today.strftime("%Y-%m-%d")]
+            )
+            for _r in _cur.fetchall():
+                if _r["cushion_value"] is not None:
+                    today_cv_map[_r["racecourse"]] = float(_r["cushion_value"])
+        _conn.close()
+    except Exception as e:
+        print(f"  [当日クッション値取得エラー: {e}]")
 
     # key = (race_date, keibajo_code, race_bango, kyosomei, cutoff_date)
     groups: dict[tuple, list] = {}
@@ -1908,6 +1935,7 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
               <span>天候: <b>{horses[0].get('tenko_fmt','-') if horses else '-'}</b></span>
               <span>芝馬場: <b>{horses[0].get('baba_shiba_fmt','-') if horses else '-'}</b></span>
               <span>ダ馬場: <b>{horses[0].get('baba_dirt_fmt','-') if horses else '-'}</b></span>
+              <span>クッション値: <b>{(lambda cv: f"{cv:.1f}（{_cv_label(cv)}）" if cv is not None else "-")(today_cv_map.get(venue_name))}</b></span>
               <span style="color:#888;font-size:.9em">※ 天候・馬場・体重・オッズはレース当日に反映</span>
             </div>
             <table>
