@@ -1256,6 +1256,64 @@ def fetch_live_odds(results: list[dict]) -> None:
         odds_conn.close()
 
 
+def fetch_live_weight(rows: list[dict]) -> None:
+    """
+    keibadata.umagoto_race_joho から当日発表の馬体重を取得し、各馬の bataiju を上書きする。
+    pckeiba(jvd_se)は当日速報馬体重を持たないため、こちらを優先する。
+    ※ analyze() の前に実行すること（体重推移・なごり判定に反映するため）。
+    馬体重は各レース発走の約50分前に順次発表される。
+    """
+    # (kaisai_nen, tsukihi, keibajo, race, umaban) → row index
+    idx_map: dict[tuple, int] = {}
+    for i, r in enumerate(rows):
+        ub = str(r.get("umaban") or "").strip().lstrip("0")
+        if not ub:
+            continue
+        try:
+            key = (r["kaisai_nen"], r["kaisai_tsukihi"],
+                   r["keibajo_code"], r["race_bango"], int(ub))
+            idx_map[key] = i
+        except (ValueError, TypeError):
+            pass
+
+    if not idx_map:
+        return
+
+    try:
+        conn = psycopg2.connect(**cfg.ODDS_DB_CONFIG)
+    except Exception as e:
+        print(f"  [馬体重DB接続エラー: {e}]")
+        return
+
+    n_updated = 0
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            unique_races = {(nen, gappi, jo, bango)
+                            for nen, gappi, jo, bango, _ in idx_map}
+            for (nen, gappi, jo, bango) in unique_races:
+                try:
+                    cur.execute("""
+                        SELECT umaban::int AS umaban, bataiju
+                        FROM umagoto_race_joho
+                        WHERE kaisai_nen   = %s
+                          AND kaisai_gappi = %s
+                          AND keibajo_code = %s
+                          AND race_bango   = %s
+                          AND bataiju ~ '^[0-9]+$'
+                          AND bataiju::int > 0
+                    """, [nen, gappi, jo, bango])
+                except Exception:
+                    continue
+                for row in cur.fetchall():
+                    key = (nen, gappi, jo, bango, row["umaban"])
+                    if key in idx_map:
+                        rows[idx_map[key]]["bataiju"] = str(row["bataiju"]).strip()
+                        n_updated += 1
+    finally:
+        conn.close()
+    print(f"  馬体重: {n_updated}頭分を当日速報で更新")
+
+
 # ── 4. HTML生成 ────────────────────────────────────────────────────────────
 
 RANK_META = {
@@ -2403,6 +2461,8 @@ if __name__ == "__main__":
     print(f"  → {len(rows)} 件の出走馬")
 
     if rows:
+        print("当日馬体重取得中...")
+        fetch_live_weight(rows)
         results = analyze(rows)
         print("前走相手データ取得中...")
         fetch_senso_opponents(results)
