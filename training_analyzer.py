@@ -1256,23 +1256,34 @@ def fetch_live_odds(results: list[dict]) -> None:
         odds_conn.close()
 
 
+# JV-Link 馬体重取得（32bit Python専用スクリプト）
+_PY32_PATH = r"C:\Users\balka\AppData\Local\Programs\Python\Python314-32\python.exe"
+
+
 def fetch_live_weight(rows: list[dict]) -> None:
     """
-    keibadata.umagoto_race_joho から当日発表の馬体重を取得し、各馬の bataiju を上書きする。
-    pckeiba(jvd_se)は当日速報馬体重を持たないため、こちらを優先する。
+    当日の馬体重を取得して各馬の bataiju を上書きする。
+    ① keibadata.umagoto_race_joho（JvLinkImporter経由）を優先取得
+    ② 未取得レースは JV-Link を 32bit Python から直接叩いて補完（0B12→SEレコード）
+       取得した馬体重は keibadata.umagoto_race_joho にも書き戻す（DB補完）
     ※ analyze() の前に実行すること（体重推移・なごり判定に反映するため）。
-    馬体重は各レース発走の約50分前に順次発表される。
     """
-    # (kaisai_nen, tsukihi, keibajo, race, umaban) → row index
+    import subprocess, json
+
+    # (nen,tsukihi,keibajo,race,umaban) → row index
     idx_map: dict[tuple, int] = {}
+    # ketto → [row index]（JV-Link補完の照合用）
+    ketto_idx: dict[str, list[int]] = {}
     for i, r in enumerate(rows):
+        k = r.get("ketto_toroku_bango")
+        if k:
+            ketto_idx.setdefault(k, []).append(i)
         ub = str(r.get("umaban") or "").strip().lstrip("0")
         if not ub:
             continue
         try:
-            key = (r["kaisai_nen"], r["kaisai_tsukihi"],
-                   r["keibajo_code"], r["race_bango"], int(ub))
-            idx_map[key] = i
+            idx_map[(r["kaisai_nen"], r["kaisai_tsukihi"],
+                     r["keibajo_code"], r["race_bango"], int(ub))] = i
         except (ValueError, TypeError):
             pass
 
@@ -1285,7 +1296,12 @@ def fetch_live_weight(rows: list[dict]) -> None:
         print(f"  [馬体重DB接続エラー: {e}]")
         return
 
-    n_updated = 0
+    def _valid(bw) -> bool:
+        s = str(bw or "").strip()
+        return s.isdigit() and int(s) > 0
+
+    n_db = 0
+    race_code_map: dict[tuple, str] = {}
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             unique_races = {(nen, gappi, jo, bango)
@@ -1293,25 +1309,73 @@ def fetch_live_weight(rows: list[dict]) -> None:
             for (nen, gappi, jo, bango) in unique_races:
                 try:
                     cur.execute("""
-                        SELECT umaban::int AS umaban, bataiju
+                        SELECT race_code, umaban::int AS umaban, bataiju
                         FROM umagoto_race_joho
-                        WHERE kaisai_nen   = %s
-                          AND kaisai_gappi = %s
-                          AND keibajo_code = %s
-                          AND race_bango   = %s
-                          AND bataiju ~ '^[0-9]+$'
-                          AND bataiju::int > 0
+                        WHERE kaisai_nen=%s AND kaisai_gappi=%s
+                          AND keibajo_code=%s AND race_bango=%s
                     """, [nen, gappi, jo, bango])
                 except Exception:
                     continue
                 for row in cur.fetchall():
-                    key = (nen, gappi, jo, bango, row["umaban"])
-                    if key in idx_map:
-                        rows[idx_map[key]]["bataiju"] = str(row["bataiju"]).strip()
-                        n_updated += 1
+                    if row.get("race_code"):
+                        race_code_map[(nen, gappi, jo, bango)] = row["race_code"]
+                    if _valid(row["bataiju"]):
+                        key = (nen, gappi, jo, bango, row["umaban"])
+                        if key in idx_map:
+                            rows[idx_map[key]]["bataiju"] = str(row["bataiju"]).strip()
+                            n_db += 1
+        print(f"  馬体重(keibadata): {n_db}頭")
+
+        # ── 未取得レースを JV-Link で補完 ──────────────────────
+        races_need = {
+            (n, g, j, b)
+            for (n, g, j, b, _ub), idx in idx_map.items()
+            if not _valid(rows[idx].get("bataiju"))
+        }
+        race_ids = [race_code_map[k] for k in races_need if k in race_code_map]
+
+        if race_ids:
+            script = str(Path(__file__).parent / "jvlink" / "fetch_weight_jvlink.py")
+            data = {}
+            try:
+                res = subprocess.run(
+                    [_PY32_PATH, script] + race_ids,
+                    capture_output=True, text=True, timeout=300,
+                    encoding="utf-8", errors="replace",
+                )
+                if res.stdout.strip():
+                    data = json.loads(res.stdout)
+            except Exception as e:
+                print(f"  [JV-Link馬体重取得エラー: {e}]")
+
+            n_jv = 0
+            db_updates = []  # (bataiju, race_code, ketto)
+            for rid, weights in data.items():
+                for ketto, info in weights.items():
+                    bw = info.get("bataiju")
+                    if not bw:
+                        continue
+                    for i in ketto_idx.get(ketto, []):
+                        rows[i]["bataiju"] = bw
+                        n_jv += 1
+                    db_updates.append((bw, rid, ketto))
+
+            # keibadata に書き戻し（DB補完）
+            if db_updates:
+                try:
+                    with conn.cursor() as ucur:
+                        for bw, rid, ketto in db_updates:
+                            ucur.execute(
+                                "UPDATE umagoto_race_joho SET bataiju=%s "
+                                "WHERE race_code=%s AND ketto_toroku_bango=%s",
+                                [bw, rid, ketto]
+                            )
+                    conn.commit()
+                except Exception as e:
+                    print(f"  [馬体重DB書き戻しエラー: {e}]")
+            print(f"  馬体重(JV-Link補完): {n_jv}頭 / DB書き戻し{len(db_updates)}件")
     finally:
         conn.close()
-    print(f"  馬体重: {n_updated}頭分を当日速報で更新")
 
 
 # ── 4. HTML生成 ────────────────────────────────────────────────────────────
