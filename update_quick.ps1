@@ -7,15 +7,11 @@ function Log($msg) {
     Add-Content $logFile "$ts  $msg"
 }
 
-Log "=== Quick Update Start ==="
+Log "=== Quick Update Start (report only) ==="
 
-# [1/2] PC-KEIBA Database
-Log "[1/2] PC-KEIBA normal data registration..."
-& powershell.exe -ExecutionPolicy Bypass -File "$ckeiba\run_pckeiba_update.ps1"
-if ($LASTEXITCODE -ne 0) { Log "[WARN] PC-KEIBA step had issues (continuing)" }
-
-# [2/2] レポート生成 + GitHub push
-Log "[2/2] Report generation..."
+# レポート生成 + GitHub push
+# オッズ=keibadata(JvLinkImporter常駐), 馬体重=keibadata+JV-Link補完 から取得するため
+# PC-KEIBAの通常データ登録は不要（朝のKeibaTotalUpdateで実施）
 Set-Location $ckeiba
 $out = & $python training_analyzer.py 2>&1
 $out | ForEach-Object { Log $_ }
