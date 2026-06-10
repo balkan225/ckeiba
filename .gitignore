@@ -13,6 +13,7 @@
 
 # ソースコード（バックアップ）
 !training_analyzer.py
+!trainer_rules.py
 !config.py.example
 !update_all.ps1
 !update_quick.ps1

@@ -1378,6 +1378,232 @@ def fetch_live_weight(rows: list[dict]) -> None:
         conn.close()
 
 
+# ── 3d. 調教師別 買いパターン判定 ──────────────────────────────────────────
+# データ基準: 坂路タイム=4F(time_gokei_4f), ウッドF明記なし=5F(time_gokei_5f)
+#            ラップ分類は classify_training (A1〜B3) を流用
+#            併せ馬/単走/先着はDB非保持 → 判定不可（△＋注釈で対応）
+
+# ルール調教師名 → DB略称（部分一致キー）。"堀宣行"のみ完全一致で堀内と区別。
+_TRAINER_KEYS = {
+    "上村洋行": "上村洋行", "中内田充正": "中内田充", "佐藤悠太": "佐藤悠",
+    "加藤士津八": "加藤士津", "千田輝彦": "千田輝彦", "吉岡辰弥": "吉岡辰弥",
+    "四位洋文": "四位洋文", "堀宣行": "堀宣行", "大久保龍志": "大久保龍",
+    "安田翔伍": "安田翔伍", "寺島良": "寺島良", "手塚貴久": "手塚貴久",
+    "斎藤誠": "斎藤誠", "木村哲也": "木村哲也", "杉山晴紀": "杉山晴紀",
+    "森一誠": "森一誠", "森秀行": "森秀行", "武幸四郎": "武幸四郎",
+    "武英智": "武英智", "池江泰寿": "池江泰寿", "牧浦充徳": "牧浦充徳",
+    "田中博康": "田中博康", "矢作芳人": "矢作芳人", "石坂公一": "石坂公一",
+    "高野友和": "高野友和", "鹿戸雄一": "鹿戸雄一", "黒岩陽一": "黒岩陽一",
+}
+
+
+def _match_trainer(name: str) -> str | None:
+    """調教師名(DB略称) → ルール調教師名。該当なしは None。"""
+    if not name:
+        return None
+    name = name.strip()
+    if name == "堀宣行":
+        return "堀宣行"
+    for rule, key in _TRAINER_KEYS.items():
+        if rule == "堀宣行":
+            continue
+        if key and key in name:
+            return rule
+    return None
+
+
+def _hc_detail(rec: dict) -> dict | None:
+    """坂路レコード → 判定用dict。"""
+    if not rec:
+        return None
+    l4 = _lap(rec.get("lap_time_4f")); l3 = _lap(rec.get("lap_time_3f"))
+    l2 = _lap(rec.get("lap_time_2f")); l1 = _lap(rec.get("lap_time_1f"))
+    if l2 is None or l1 is None:
+        return None
+    return {
+        "type": "坂路",
+        "date": str(rec.get("chokyo_nengappi") or "").strip(),
+        "t4f": _tg(rec.get("time_gokei_4f")),
+        "l4": l4, "l3": l3, "l2": l2, "l1": l1,
+        "rank": classify_training(l2, l1),
+        "accel": l1 < l2,
+    }
+
+
+def _wc_detail(rec: dict) -> dict | None:
+    """ウッドレコード → 判定用dict。"""
+    if not rec:
+        return None
+    l2 = _lap(rec.get("lap_time_2f")); l1 = _lap(rec.get("lap_time_1f"))
+    return {
+        "type": "ウッド",
+        "date": str(rec.get("chokyo_nengappi") or "").strip(),
+        "t6f": _tg(rec.get("time_gokei_6f")),
+        "t5f": _tg(rec.get("time_gokei_5f")),
+        "t4f": _tg(rec.get("time_gokei_4f")),
+        "l2": l2, "l1": l1,
+        "rank": (classify_training(l2, l1) if (l2 and l1) else None),
+        "accel": (l1 < l2 if (l2 and l1) else False),
+    }
+
+
+def _week_of(cho_str: str, race_str: str):
+    """調教日とレース日から (週数, 曜日, 前日フラグ) を返す。
+    週数: 0=レース当週, 1=前週(=1週前土日), 2=2週前
+    曜日: Mon=0 .. Sun=6
+    """
+    try:
+        cd = date(int(cho_str[:4]), int(cho_str[4:6]), int(cho_str[6:]))
+        rd = date(int(race_str[:4]), int(race_str[4:6]), int(race_str[6:]))
+    except (ValueError, TypeError):
+        return None, None, False
+    rmon = rd - timedelta(days=rd.weekday())
+    cmon = cd - timedelta(days=cd.weekday())
+    weeks = (rmon - cmon).days // 7
+    is_mae = (cd == rd - timedelta(days=1))
+    return weeks, cd.weekday(), is_mae
+
+
+def _build_timeseries(hc_recs: list, wc_recs: list, race_str: str) -> dict:
+    """期間別（土日/前日/追い切り/2週前）の坂路・ウッド最速調教を返す。"""
+    tr = {
+        "ss_hc": None, "ss_wc": None,    # 1週前土日
+        "mae_hc": None, "mae_wc": None,  # 前日
+        "oi_hc": None, "oi_wc": None,    # 追い切り（当週水木）
+        "oi_type": None,                 # 最終追い切りの種別
+        "ss2_hc": None, "ss2_wc": None,  # 2週前土日
+    }
+
+    def _faster_hc(a, b):
+        if a is None: return b
+        if b is None: return a
+        return a if (a["t4f"] or 999) <= (b["t4f"] or 999) else b
+
+    def _faster_wc(a, b):
+        if a is None: return b
+        if b is None: return a
+        return a if (a["t5f"] or 999) <= (b["t5f"] or 999) else b
+
+    oi_hc_recs, oi_wc_recs = [], []   # 当週水木
+    for rec in hc_recs:
+        d = _hc_detail(rec)
+        if not d: continue
+        w, wd, is_mae = _week_of(d["date"], race_str)
+        if w is None: continue
+        if is_mae:
+            tr["mae_hc"] = _faster_hc(tr["mae_hc"], d)
+        if w == 1 and wd in (5, 6):
+            tr["ss_hc"] = _faster_hc(tr["ss_hc"], d)
+        elif w == 2 and wd in (5, 6):
+            tr["ss2_hc"] = _faster_hc(tr["ss2_hc"], d)
+        elif w == 0 and wd in (2, 3):
+            oi_hc_recs.append(d)
+            tr["oi_hc"] = _faster_hc(tr["oi_hc"], d)
+
+    for rec in wc_recs:
+        d = _wc_detail(rec)
+        if not d: continue
+        w, wd, is_mae = _week_of(d["date"], race_str)
+        if w is None: continue
+        if is_mae:
+            tr["mae_wc"] = _faster_wc(tr["mae_wc"], d)
+        if w == 1 and wd in (5, 6):
+            tr["ss_wc"] = _faster_wc(tr["ss_wc"], d)
+        elif w == 2 and wd in (5, 6):
+            tr["ss2_wc"] = _faster_wc(tr["ss2_wc"], d)
+        elif w == 0 and wd in (2, 3):
+            oi_wc_recs.append(d)
+            tr["oi_wc"] = _faster_wc(tr["oi_wc"], d)
+
+    # 追い切り種別 = 当週水木の最新日の種別
+    latest_date, latest_type = "", None
+    for d in oi_hc_recs + oi_wc_recs:
+        if d["date"] > latest_date:
+            latest_date = d["date"]; latest_type = d["type"]
+    tr["oi_type"] = latest_type
+    return tr
+
+
+def fetch_trainer_data(rows: list[dict]) -> None:
+    """対象厩舎の馬に、判定用データ（馬齢/騎手/レース条件/時系列調教）を付与する。"""
+    for r in rows:
+        r["trainer_rule"] = _match_trainer(r.get("trainer"))
+    targets = [r for r in rows if r.get("trainer_rule")]
+    if not targets:
+        return
+
+    try:
+        conn = psycopg2.connect(**cfg.DB_CONFIG)
+    except Exception as e:
+        print(f"  [調教師判定DB接続エラー: {e}]")
+        return
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            for r in targets:
+                ketto = r["ketto_toroku_bango"]
+                race_str = r["race_date_str"]
+
+                # 馬齢・騎手・性別
+                cur.execute("""
+                    SELECT barei, kishumei_ryakusho, seibetsu_code
+                    FROM jvd_se
+                    WHERE ketto_toroku_bango=%s AND kaisai_nen=%s AND kaisai_tsukihi=%s
+                      AND keibajo_code=%s AND race_bango=%s
+                      AND data_kubun IN ('1','2','7','9')
+                    ORDER BY data_kubun DESC LIMIT 1
+                """, [ketto, r["kaisai_nen"], r["kaisai_tsukihi"],
+                      r["keibajo_code"], r["race_bango"]])
+                row = cur.fetchone()
+                if row:
+                    try:
+                        r["barei"] = int(str(row["barei"]).strip())
+                    except (ValueError, TypeError):
+                        r["barei"] = None
+                    r["kishu"] = (row.get("kishumei_ryakusho") or "").strip()
+
+                # レース条件（グレード・競走種別）
+                cur.execute("""
+                    SELECT grade_code, kyoso_shubetsu_code, kyoso_joken_meisho
+                    FROM jvd_ra
+                    WHERE kaisai_nen=%s AND kaisai_tsukihi=%s
+                      AND keibajo_code=%s AND race_bango=%s LIMIT 1
+                """, [r["kaisai_nen"], r["kaisai_tsukihi"],
+                      r["keibajo_code"], r["race_bango"]])
+                ra = cur.fetchone()
+                if ra:
+                    r["grade_code"] = (ra.get("grade_code") or "").strip()
+                    r["kyoso_shubetsu"] = (ra.get("kyoso_shubetsu_code") or "").strip()
+                    r["is_shinba"] = "新馬" in (ra.get("kyoso_joken_meisho") or "")
+
+                # 時系列調教（21日前〜レース前日）
+                try:
+                    rd = date(int(race_str[:4]), int(race_str[4:6]), int(race_str[6:]))
+                    start = (rd - timedelta(days=21)).strftime("%Y%m%d")
+                except (ValueError, TypeError):
+                    continue
+                cur.execute("""
+                    SELECT chokyo_nengappi, time_gokei_4f,
+                           lap_time_4f, lap_time_3f, lap_time_2f, lap_time_1f
+                    FROM jvd_hc
+                    WHERE ketto_toroku_bango=%s
+                      AND chokyo_nengappi BETWEEN %s AND %s
+                """, [ketto, start, race_str])
+                hc_recs = [dict(x) for x in cur.fetchall()]
+                cur.execute("""
+                    SELECT chokyo_nengappi, time_gokei_6f, time_gokei_5f, time_gokei_4f,
+                           lap_time_2f, lap_time_1f
+                    FROM jvd_wc
+                    WHERE ketto_toroku_bango=%s
+                      AND chokyo_nengappi BETWEEN %s AND %s
+                """, [ketto, start, race_str])
+                wc_recs = [dict(x) for x in cur.fetchall()]
+                r["tr"] = _build_timeseries(hc_recs, wc_recs, race_str)
+    finally:
+        conn.close()
+    print(f"  調教師判定データ: 対象{len(targets)}頭")
+
+
 # ── 4. HTML生成 ────────────────────────────────────────────────────────────
 
 RANK_META = {
@@ -1514,6 +1740,23 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
             except (ValueError, TypeError):
                 return (99, h["bamei"])
 
+        def _trainer_flag_html(h):
+            """調教師買いパターンのマーク＋ツールチップHTML。"""
+            tf = h.get("trainer_flag")
+            if not tf:
+                return ""
+            mark = tf["mark"]
+            bg = {"◎": "#c0392b", "○": "#e67e00", "△": "#888"}.get(mark, "#888")
+            lines = list(tf.get("reasons", []))
+            lines += [f"※{n}" for n in tf.get("notes", [])]
+            tip = (f'{tf.get("trainer","")} 買いパターン<br>'
+                   + "<br>".join(l.replace("<", "&lt;").replace(">", "&gt;") for l in lines))
+            return (
+                f'<span class="tr-flag-wrap">'
+                f'<span class="tr-flag" style="background:{bg}">{mark}買</span>'
+                f'<span class="tr-tip">{tip}</span></span>'
+            )
+
         for h in sorted(horses, key=_umaban_key):
             hc_rank = h["rank"]
             wc_rank = h["wc_rank"]
@@ -1581,7 +1824,8 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
             training_html += (
                 f'<tr class="horse-sep" style="background:{hc_bg}">'
                 f'<td rowspan="2" class="horse-name">'
-                f'{_num_prefix}{h["bamei"]}<br><span class="trainer-name">{h["trainer"]}</span></td>'
+                f'{_num_prefix}{h["bamei"]}{_trainer_flag_html(h)}'
+                f'<br><span class="trainer-name">{h["trainer"]}</span></td>'
                 f'<td class="type-hc">坂路</td>'
                 f'<td style="text-align:center">{h["chokyo_date_fmt"]}</td>'
                 f'<td style="text-align:center">{h["chokyo_yobi"]}</td>'
@@ -2249,6 +2493,22 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
     }}
     .past-cell:hover .tt {{ display: block; }}
 
+    /* 調教師買いパターン フラグ */
+    .tr-flag-wrap {{ position: relative; display: inline-block; margin-left: 4px; }}
+    .tr-flag {{
+      color: #fff; font-size: .72em; font-weight: bold;
+      padding: 1px 5px; border-radius: 4px; cursor: help; white-space: nowrap;
+    }}
+    .tr-tip {{
+      display: none; position: absolute; bottom: calc(100% + 4px); left: 50%;
+      transform: translateX(-50%);
+      background: #1a1a2e; color: #f0f0f0; padding: 7px 11px;
+      border-radius: 5px; font-size: .9em; font-weight: normal;
+      line-height: 1.5; white-space: nowrap; text-align: left;
+      z-index: 300; box-shadow: 0 2px 8px rgba(0,0,0,.4);
+    }}
+    .tr-flag-wrap:hover .tr-tip {{ display: block; }}
+
     /* コース適性タブ */
     .cs-th {{ background: #2e3a4e; font-size: .82em; text-align:center; min-width:100px; }}
     .cs-cell {{ vertical-align:top; font-size:.82em; padding:4px 6px; min-width:100px; }}
@@ -2560,6 +2820,11 @@ if __name__ == "__main__":
         fetch_senso_opponents(results)
         print("リアルタイムオッズ取得中...")
         fetch_live_odds(results)
+        print("調教師買いパターン判定中...")
+        fetch_trainer_data(results)
+        from trainer_rules import judge_trainer
+        for h in results:
+            h["trainer_flag"] = judge_trainer(h)
         out = str(Path(__file__).parent / "report.html")
         generate_html(results, out, data_source=source)
         push_to_github(out)
