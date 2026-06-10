@@ -366,9 +366,10 @@ def fetch_data() -> tuple[list[dict], str]:
                       AND lap_time_2f   <> '000' AND lap_time_1f <> '000'
                     ORDER BY ketto_toroku_bango, time_gokei_4f ASC
                 """
+                # ウッドは6F計測なし(4Fのみ追い等)も拾えるよう全件取得し
+                # Python側で「6F→5F→4F」優先の最速を選ぶ
                 _wc_sql = f"""
-                    SELECT DISTINCT ON (ketto_toroku_bango)
-                        ketto_toroku_bango, chokyo_nengappi, chokyo_jikoku, tracen_kubun, course,
+                    SELECT ketto_toroku_bango, chokyo_nengappi, chokyo_jikoku, tracen_kubun, course,
                         time_gokei_6f, lap_time_6f,
                         time_gokei_5f, lap_time_5f,
                         time_gokei_4f, lap_time_4f,
@@ -378,9 +379,7 @@ def fetch_data() -> tuple[list[dict], str]:
                     FROM jvd_wc
                     WHERE ketto_toroku_bango IN ({ph})
                       AND chokyo_nengappi >= %s AND chokyo_nengappi < %s
-                      AND time_gokei_6f <> '0000'
                       AND lap_time_1f   <> '000'
-                    ORDER BY ketto_toroku_bango, time_gokei_6f ASC
                 """
 
                 # 坂路
@@ -388,10 +387,23 @@ def fetch_data() -> tuple[list[dict], str]:
                 for r in cur.fetchall():
                     hc_map[r["ketto_toroku_bango"]] = dict(r)
 
-                # ウッドチップ（6F基準）
+                # ウッドチップ（6F→5F→4F の順で計測ありの最速を採用）
+                def _pick_wc(recs):
+                    for fld in ("time_gokei_6f", "time_gokei_5f", "time_gokei_4f"):
+                        valid = [r for r in recs
+                                 if str(r.get(fld) or "").strip() not in ("0000", "000", "")]
+                        if valid:
+                            return min(valid, key=lambda r: int(str(r[fld]).strip()))
+                    return None
+
                 cur.execute(_wc_sql, kl + [cutoff, race_date_str])
+                _wc_by_ketto: dict[str, list] = {}
                 for r in cur.fetchall():
-                    wc_map[r["ketto_toroku_bango"]] = dict(r)
+                    _wc_by_ketto.setdefault(r["ketto_toroku_bango"], []).append(dict(r))
+                for ketto_w, recs_w in _wc_by_ketto.items():
+                    best_w = _pick_wc(recs_w)
+                    if best_w:
+                        wc_map[ketto_w] = best_w
 
             # ── Step 5: 結合 ───────────────────────────────────────────────
             results: list[dict] = []
