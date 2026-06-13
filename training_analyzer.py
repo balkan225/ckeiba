@@ -1517,6 +1517,106 @@ def fetch_live_track(rows: list[dict]) -> None:
     print(f"  天候・馬場(keibadata補完): {n}頭分")
 
 
+# ── 3e. 血統（種牡馬）成績 ─────────────────────────────────────────────────
+
+def fetch_pedigree(rows: list[dict]) -> None:
+    """
+    各馬の血統（父・母・母父）を取得し、今回の競馬場×距離での
+    父（種牡馬）の過去成績（勝率・複勝率・単複回収率）を付与する。
+    - r["pedigree"]   = {chichi, haha, bofu, chichi_no}
+    - r["chichi_stat"]= {n, win, fuku, tan_ret, fuku_ret} or None
+    """
+    if not rows:
+        return
+    try:
+        conn = psycopg2.connect(**cfg.DB_CONFIG)
+    except Exception as e:
+        print(f"  [血統DB接続エラー: {e}]")
+        return
+
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # ① 各馬の血統（父01/母02/母父05）
+            kettos = list({r["ketto_toroku_bango"] for r in rows})
+            ped: dict[str, dict] = {}
+            for i in range(0, len(kettos), 1000):
+                chunk = kettos[i:i + 1000]
+                ph = ", ".join(["%s"] * len(chunk))
+                cur.execute(f"""
+                    SELECT ketto_toroku_bango,
+                           ketto_joho_01a, ketto_joho_01b,
+                           ketto_joho_02b, ketto_joho_05b
+                    FROM jvd_um WHERE ketto_toroku_bango IN ({ph})
+                """, chunk)
+                for r in cur.fetchall():
+                    ped[r["ketto_toroku_bango"]] = {
+                        "chichi_no": (r["ketto_joho_01a"] or "").strip(),
+                        "chichi": (r["ketto_joho_01b"] or "").strip(),
+                        "haha":   (r["ketto_joho_02b"] or "").strip(),
+                        "bofu":   (r["ketto_joho_05b"] or "").strip(),
+                    }
+
+            # ② 父 × 今回(競馬場×距離) の成績を一括集計（単複回収率込み）
+            chichi_set = {p["chichi_no"] for p in ped.values() if p["chichi_no"]}
+            race_set = {(r["keibajo_code"], str(r.get("race_kyori") or "").strip())
+                        for r in rows if r.get("race_kyori")}
+            stat: dict[tuple, dict] = {}
+            if chichi_set and race_set:
+                cl = list(chichi_set)
+                rl = list(race_set)
+                ph_c = ", ".join(["%s"] * len(cl))
+                race_cond = " OR ".join(["(ra.keibajo_code=%s AND ra.kyori=%s)"] * len(rl))
+                params = cl + [x for pair in rl for x in pair]
+                cur.execute(f"""
+                    SELECT um.ketto_joho_01a AS chichi, ra.keibajo_code, ra.kyori,
+                      COUNT(*) AS n,
+                      SUM(CASE WHEN se.kakutei_chakujun='01' THEN 1 ELSE 0 END) AS win,
+                      SUM(CASE WHEN se.kakutei_chakujun IN ('01','02','03') THEN 1 ELSE 0 END) AS fuku,
+                      SUM(CASE se.umaban
+                            WHEN hr.haraimodoshi_tansho_1a THEN hr.haraimodoshi_tansho_1b::int
+                            WHEN hr.haraimodoshi_tansho_2a THEN hr.haraimodoshi_tansho_2b::int
+                            ELSE 0 END) AS tan_pay,
+                      SUM(CASE se.umaban
+                            WHEN hr.haraimodoshi_fukusho_1a THEN hr.haraimodoshi_fukusho_1b::int
+                            WHEN hr.haraimodoshi_fukusho_2a THEN hr.haraimodoshi_fukusho_2b::int
+                            WHEN hr.haraimodoshi_fukusho_3a THEN hr.haraimodoshi_fukusho_3b::int
+                            WHEN hr.haraimodoshi_fukusho_4a THEN hr.haraimodoshi_fukusho_4b::int
+                            WHEN hr.haraimodoshi_fukusho_5a THEN hr.haraimodoshi_fukusho_5b::int
+                            ELSE 0 END) AS fuku_pay
+                    FROM jvd_se se
+                    JOIN jvd_um um ON um.ketto_toroku_bango = se.ketto_toroku_bango
+                    JOIN jvd_ra ra ON ra.kaisai_nen=se.kaisai_nen AND ra.kaisai_tsukihi=se.kaisai_tsukihi
+                      AND ra.keibajo_code=se.keibajo_code AND ra.race_bango=se.race_bango
+                    JOIN jvd_hr hr ON hr.kaisai_nen=se.kaisai_nen AND hr.kaisai_tsukihi=se.kaisai_tsukihi
+                      AND hr.keibajo_code=se.keibajo_code AND hr.race_bango=se.race_bango
+                    WHERE um.ketto_joho_01a IN ({ph_c}) AND ({race_cond})
+                      AND se.kakutei_chakujun ~ '^[0-9]+$' AND se.kakutei_chakujun<>'00'
+                    GROUP BY um.ketto_joho_01a, ra.keibajo_code, ra.kyori
+                """, params)
+                for r in cur.fetchall():
+                    n = r["n"] or 0
+                    if n == 0:
+                        continue
+                    stat[(r["chichi"], r["keibajo_code"], str(r["kyori"]).strip())] = {
+                        "n": n, "win": r["win"], "fuku": r["fuku"],
+                        "win_rate": r["win"] / n,
+                        "fuku_rate": r["fuku"] / n,
+                        "tan_ret": (r["tan_pay"] or 0) / (n * 100),
+                        "fuku_ret": (r["fuku_pay"] or 0) / (n * 100),
+                    }
+
+            # ③ 各馬に付与
+            for r in rows:
+                p = ped.get(r["ketto_toroku_bango"], {})
+                r["pedigree"] = p
+                key = (p.get("chichi_no"), r["keibajo_code"],
+                       str(r.get("race_kyori") or "").strip())
+                r["chichi_stat"] = stat.get(key)
+    finally:
+        conn.close()
+    print(f"  血統成績: {len(rows)}頭分")
+
+
 # ── 3d. 調教師別 買いパターン判定 ──────────────────────────────────────────
 # データ基準: 坂路タイム=4F(time_gokei_4f), ウッドF明記なし=5F(time_gokei_5f)
 #            ラップ分類は classify_training (A1〜B3) を流用
@@ -1938,6 +2038,7 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
         senso_html     = ""
         ai_cards       = []
         today_html     = ""   # 当日情報タブ
+        ped_html       = ""   # 血統タブ
 
         def _umaban_key(h):
             try:
@@ -2437,6 +2538,51 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
                 f'</tr>\n'
             )
 
+            # ── 血統タブ: 1行 ─────────────────────────────────────────
+            ped = h.get("pedigree", {})
+            st = h.get("chichi_stat")
+            if st:
+                n = st["n"]
+                wr = st["win_rate"] * 100
+                fr = st["fuku_rate"] * 100
+                tr_ = st["tan_ret"] * 100
+                fk_ = st["fuku_ret"] * 100
+                # 適性マーク: 複勝率/回収率で評価（n>=10で信頼）
+                if n >= 10 and (fr >= 35 or tr_ >= 110 or fk_ >= 110):
+                    aptmark = '<span style="background:#c0392b;color:#fff;border-radius:4px;padding:1px 7px;font-weight:bold">◎</span>'
+                elif n >= 10 and (fr >= 28 or tr_ >= 85 or fk_ >= 90):
+                    aptmark = '<span style="background:#e67e00;color:#fff;border-radius:4px;padding:1px 7px;font-weight:bold">○</span>'
+                elif n < 5:
+                    aptmark = '<span style="color:#bbb;font-size:.85em">―(少)</span>'
+                else:
+                    aptmark = '<span style="color:#888">△</span>'
+
+                def _rc(v):  # 回収率の色
+                    return "#c0392b" if v >= 100 else ("#1a7a3a" if v >= 80 else "#666")
+                stat_cell = (
+                    f'<td style="text-align:center;font-size:.82em">{n}戦</td>'
+                    f'<td style="text-align:center">{wr:.0f}%</td>'
+                    f'<td style="text-align:center">{fr:.0f}%</td>'
+                    f'<td style="text-align:center;font-weight:bold;color:{_rc(tr_)}">{tr_:.0f}%</td>'
+                    f'<td style="text-align:center;font-weight:bold;color:{_rc(fk_)}">{fk_:.0f}%</td>'
+                    f'<td style="text-align:center">{aptmark}</td>'
+                )
+            else:
+                stat_cell = ('<td colspan="5" style="text-align:center;color:#bbb;font-size:.85em">'
+                             '該当データなし</td>'
+                             '<td style="text-align:center;color:#bbb">―</td>')
+
+            ped_html += (
+                f'<tr class="horse-sep">'
+                f'<td class="horse-name">{_np_s}{h["bamei"]}'
+                f'<br><span class="trainer-name">{h["trainer"]}</span></td>'
+                f'<td style="font-size:.86em">{ped.get("chichi","-")}</td>'
+                f'<td style="font-size:.82em;color:#555">{ped.get("haha","-")}</td>'
+                f'<td style="font-size:.86em">{ped.get("bofu","-")}</td>'
+                + stat_cell +
+                f'</tr>\n'
+            )
+
         # スコア降順でカードを並べる
         ai_cards.sort(key=lambda x: -x[0])
         ai_html = '<div class="ai-grid">' + "".join(c for _, c in ai_cards) + '</div>'
@@ -2464,6 +2610,7 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
             <button class="tab-btn"        onclick="switchTab(this,'cushion')">🌱 クッション</button>
             <button class="tab-btn"        onclick="switchTab(this,'course')">🏇 コース適性</button>
             <button class="tab-btn"        onclick="switchTab(this,'senso')">🔄 前走相手</button>
+            <button class="tab-btn"        onclick="switchTab(this,'pedigree')">🧬 血統</button>
             <button class="tab-btn"        onclick="switchTab(this,'ai')">📊 総評</button>
           </div>
           <div class="tab-pane" data-pane="today">
@@ -2543,6 +2690,24 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
               ※ 行をクリックすると相手馬の詳細が展開されます。
               3着内率が高い ＝ 前走は強いメンバー構成。
             </p>
+          </div>
+          <div class="tab-pane" data-pane="pedigree" style="display:none">
+            <p style="font-size:.78em;color:#888;margin:4px 0 8px">
+              ※ 父（種牡馬）の「{venue_name}{horses[0].get('race_kyori','') if horses else ''}m」での過去成績。
+              回収率は単勝/複勝とも全頭均等購入ベース。◎=複勝率35%↑ or 回収率110%↑（10戦以上）。
+            </p>
+            <table>
+              <thead><tr>
+                <th>馬名</th><th>父</th><th>母</th><th>母父</th>
+                <th class="cs-th" style="min-width:50px">出走</th>
+                <th class="cs-th" style="min-width:50px">勝率</th>
+                <th class="cs-th" style="min-width:50px">複勝率</th>
+                <th class="cs-th" style="min-width:60px">単回収</th>
+                <th class="cs-th" style="min-width:60px">複回収</th>
+                <th class="cs-th" style="min-width:50px">適性</th>
+              </tr></thead>
+              <tbody>{ped_html}</tbody>
+            </table>
           </div>
           <div class="tab-pane" data-pane="ai" style="display:none">
             <p style="font-size:.78em;color:#888;margin:4px 0 10px">
@@ -3059,6 +3224,8 @@ if __name__ == "__main__":
         from trainer_rules import judge_trainer
         for h in results:
             h["trainer_flag"] = judge_trainer(h)
+        print("血統成績集計中...")
+        fetch_pedigree(results)
         out = str(Path(__file__).parent / "report.html")
         generate_html(results, out, data_source=source)
         push_to_github(out)
