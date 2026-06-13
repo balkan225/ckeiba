@@ -1390,6 +1390,72 @@ def fetch_live_weight(rows: list[dict]) -> None:
         conn.close()
 
 
+def fetch_live_track(rows: list[dict]) -> None:
+    """
+    当日の天候・芝馬場・ダート馬場を keibadata.race_shosai から取得して補完する。
+    pckeiba(jvd_ra)は当日発表データを持たない（'0'）ため、こちらで補う。
+    ※ analyze() の前に実行すること。
+    """
+    races = {(r["kaisai_nen"], r["kaisai_tsukihi"], r["keibajo_code"], r["race_bango"])
+             for r in rows if r.get("race_bango")}
+    if not races:
+        return
+
+    try:
+        conn = psycopg2.connect(**cfg.ODDS_DB_CONFIG)
+    except Exception as e:
+        print(f"  [天候・馬場DB接続エラー: {e}]")
+        return
+
+    def _unset(v):
+        return str(v or "0").strip() in ("0", "")
+
+    track_map = {}
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            for (nen, gappi, jo, bango) in races:
+                try:
+                    cur.execute("""
+                        SELECT tenko_code, shiba_babajotai_code, dirt_babajotai_code
+                        FROM race_shosai
+                        WHERE kaisai_nen=%s AND kaisai_gappi=%s
+                          AND keibajo_code=%s AND race_bango=%s LIMIT 1
+                    """, [nen, gappi, jo, bango])
+                    row = cur.fetchone()
+                    if row:
+                        track_map[(nen, gappi, jo, bango)] = row
+                except Exception:
+                    continue
+    finally:
+        conn.close()
+
+    # 競馬場単位で芝馬場・ダ馬場・天候を集約（非0の値を採用）
+    # ※芝レース行はダ馬場が0、ダレース行は芝馬場が0になるため、
+    #   当日情報ヘッダーで芝・ダ両方を表示できるよう競馬場単位でまとめる
+    v_shiba, v_dirt, v_tenko = {}, {}, {}
+    for (nen, gappi, jo, bango), row in track_map.items():
+        if not _unset(row["shiba_babajotai_code"]):
+            v_shiba[jo] = row["shiba_babajotai_code"]
+        if not _unset(row["dirt_babajotai_code"]):
+            v_dirt[jo] = row["dirt_babajotai_code"]
+        if not _unset(row["tenko_code"]):
+            v_tenko.setdefault(jo, row["tenko_code"])
+
+    n = 0
+    for r in rows:
+        jo = r["keibajo_code"]
+        updated = False
+        if _unset(r.get("tenko_code")) and jo in v_tenko:
+            r["tenko_code"] = v_tenko[jo]; updated = True
+        if _unset(r.get("race_babajotai_shiba")) and jo in v_shiba:
+            r["race_babajotai_shiba"] = v_shiba[jo]; updated = True
+        if _unset(r.get("race_babajotai_dirt")) and jo in v_dirt:
+            r["race_babajotai_dirt"] = v_dirt[jo]; updated = True
+        if updated:
+            n += 1
+    print(f"  天候・馬場(keibadata補完): {n}頭分")
+
+
 # ── 3d. 調教師別 買いパターン判定 ──────────────────────────────────────────
 # データ基準: 坂路タイム=4F(time_gokei_4f), ウッドF明記なし=5F(time_gokei_5f)
 #            ラップ分類は classify_training (A1〜B3) を流用
@@ -2827,6 +2893,8 @@ if __name__ == "__main__":
     if rows:
         print("当日馬体重取得中...")
         fetch_live_weight(rows)
+        print("当日天候・馬場取得中...")
+        fetch_live_track(rows)
         results = analyze(rows)
         print("前走相手データ取得中...")
         fetch_senso_opponents(results)
