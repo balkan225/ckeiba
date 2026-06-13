@@ -77,8 +77,8 @@ def main():
         return
 
     try:
-        import win32com.client as w
-        jv = w.Dispatch("JVDTLab.JVLink")
+        import win32com.client.dynamic  # gen_pyキャッシュ破損を回避
+        jv = win32com.client.dynamic.Dispatch("JVDTLab.JVLink")
         jv.JVInit("UNKNOWN")
     except Exception as e:
         sys.stderr.write(f"JV-Link init error: {e}\n")

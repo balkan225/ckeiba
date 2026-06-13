@@ -1395,10 +1395,14 @@ def fetch_live_weight(rows: list[dict]) -> None:
 
 def fetch_live_track(rows: list[dict]) -> None:
     """
-    当日の天候・芝馬場・ダート馬場を keibadata.race_shosai から取得して補完する。
-    pckeiba(jvd_ra)は当日発表データを持たない（'0'）ため、こちらで補う。
+    当日の天候・芝馬場・ダート馬場を補完する。
+    ① keibadata.race_shosai（JvLinkImporter経由）を優先取得
+    ② 未取得レースは JV-Link を 32bit Python から直接叩いて補完（0B12→RAレコード）
+       取得値は keibadata.race_shosai にも書き戻す。
     ※ analyze() の前に実行すること。
     """
+    import subprocess, json
+
     races = {(r["kaisai_nen"], r["kaisai_tsukihi"], r["keibajo_code"], r["race_bango"])
              for r in rows if r.get("race_bango")}
     if not races:
@@ -1419,16 +1423,65 @@ def fetch_live_track(rows: list[dict]) -> None:
             for (nen, gappi, jo, bango) in races:
                 try:
                     cur.execute("""
-                        SELECT tenko_code, shiba_babajotai_code, dirt_babajotai_code
+                        SELECT race_code, tenko_code, shiba_babajotai_code, dirt_babajotai_code
                         FROM race_shosai
                         WHERE kaisai_nen=%s AND kaisai_gappi=%s
                           AND keibajo_code=%s AND race_bango=%s LIMIT 1
                     """, [nen, gappi, jo, bango])
                     row = cur.fetchone()
                     if row:
-                        track_map[(nen, gappi, jo, bango)] = row
+                        track_map[(nen, gappi, jo, bango)] = dict(row)
                 except Exception:
                     continue
+
+        # ── 未取得レースを JV-Link で補完 ──────────────────────
+        need = {k: v for k, v in track_map.items()
+                if v.get("race_code")
+                and _unset(v["tenko_code"]) and _unset(v["shiba_babajotai_code"])
+                and _unset(v["dirt_babajotai_code"])}
+        race_ids = [v["race_code"] for v in need.values()]
+        if race_ids:
+            script = str(Path(__file__).parent / "jvlink" / "fetch_track_jvlink.py")
+            data = {}
+            try:
+                res = subprocess.run(
+                    [_PY32_PATH, script] + race_ids,
+                    capture_output=True, text=True, timeout=300,
+                    encoding="utf-8", errors="replace",
+                )
+                if res.stdout.strip():
+                    data = json.loads(res.stdout)
+            except Exception as e:
+                print(f"  [JV-Link天候・馬場取得エラー: {e}]")
+
+            n_jv = 0
+            db_updates = []
+            for key, v in need.items():
+                rid = v["race_code"]
+                t = data.get(rid)
+                if not t:
+                    continue
+                track_map[key]["tenko_code"] = t.get("tenko", "")
+                track_map[key]["shiba_babajotai_code"] = t.get("shiba", "")
+                track_map[key]["dirt_babajotai_code"] = t.get("dirt", "")
+                db_updates.append((t.get("tenko", ""), t.get("shiba", ""),
+                                   t.get("dirt", ""), rid))
+                n_jv += 1
+            if db_updates:
+                try:
+                    with conn.cursor() as ucur:
+                        for tk, sb, db, rid in db_updates:
+                            ucur.execute(
+                                "UPDATE race_shosai SET tenko_code=%s, "
+                                "shiba_babajotai_code=%s, dirt_babajotai_code=%s "
+                                "WHERE race_code=%s",
+                                [tk, sb, db, rid]
+                            )
+                    conn.commit()
+                except Exception as e:
+                    print(f"  [天候・馬場DB書き戻しエラー: {e}]")
+            if n_jv:
+                print(f"  天候・馬場(JV-Link補完): {n_jv}レース")
     finally:
         conn.close()
 
