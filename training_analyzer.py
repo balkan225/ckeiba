@@ -1716,6 +1716,47 @@ KEIBAJO_NAME = {
 }
 
 
+# トラックコード → (回り, 内外)。JV-Data Ver4仕様（実データ確認済み）
+# 10-22=芝, 23-28=ダート, 29=ダ直線, 51-59=障害
+_TRACK_INFO = {
+    "10": ("左", ""),     "11": ("左", "外"),   "12": ("左", "内"),
+    "13": ("左", "内→外"), "14": ("左", "外→内"),
+    "15": ("左", "外2周"), "16": ("左", "内2周"),
+    "17": ("右", ""),     "18": ("右", "外"),   "19": ("右", "内"),
+    "20": ("右", "内→外"), "21": ("右", "外→内"),
+    "22": ("右", "外2周"),
+    "23": ("左", ""),     "24": ("右", ""),
+    "25": ("左", "内"),   "26": ("左", "外"),
+    "27": ("右", "内"),   "28": ("右", "外"),
+    "29": ("直線", ""),
+}
+
+
+def _course_info_str(track_code, kyori) -> str:
+    """track_code・距離 → 'ダ1600m・右回り（外回り）' 形式の表示文字列。"""
+    tt = _track_type(track_code)            # 芝 / ダート / 障害扱い
+    info = _TRACK_INFO.get(str(track_code or "").strip())
+    parts = []
+    if tt:
+        parts.append(tt)
+    try:
+        k = int(str(kyori or "").strip())
+        if k > 0:
+            parts.append(f"{k}m")
+    except (ValueError, TypeError):
+        pass
+    s = "".join(parts)
+    if info:
+        mawari, naigai = info
+        if mawari == "直線":
+            s += "・直線"
+        elif mawari:
+            s += f"・{mawari}回り"
+        if naigai:
+            s += f"（{naigai}回り）"
+    return s
+
+
 _SOURCE_DISP = {
     "se2":   "出馬表（確定）",
     "se1":   "出走馬名表",
@@ -2304,9 +2345,16 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
         ai_cards.sort(key=lambda x: -x[0])
         ai_html = '<div class="ai-grid">' + "".join(c for _, c in ai_cards) + '</div>'
 
+        _course_str = _course_info_str(
+            horses[0].get("race_track_code") if horses else None,
+            horses[0].get("race_kyori") if horses else None,
+        )
+        _course_html = (f'<p class="course-info">{_course_str}</p>'
+                        if _course_str else "")
         sections_html += f"""
         <section data-date="{race_date}" data-venue="{keibajo}" data-race="{race_no:02d}" style="display:none">
           <h2>{race_date}　{venue_name}　{race_no}R　{kyosomei}</h2>
+          {_course_html}
           <p class="sub">調教取得期間: {cutoff_fmt}（前週土曜）〜 レース前日　／　選択基準: 4F最速タイム</p>
           <div class="tab-bar">
             <button class="tab-btn active" onclick="switchTab(this,'today')">📅 当日情報</button>
@@ -2526,6 +2574,10 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
     section {{ background: #fff; border-radius: 8px; padding: 16px 20px; box-shadow: 0 1px 4px rgba(0,0,0,.08); }}
     section h2 {{ margin: 0 0 4px; font-size: 1.05em; color: #1a1a2e; }}
     .sub {{ font-size: .8em; color: #888; margin: 0 0 12px; }}
+    .course-info {{
+      font-size: .92em; font-weight: bold; color: #1a5276;
+      margin: 2px 0 4px; letter-spacing: .02em;
+    }}
 
     table {{ border-collapse: collapse; width: 100%; font-size: .88em; }}
     th, td {{ border: 1px solid #ddd; padding: 5px 10px; white-space: nowrap; }}
