@@ -34,8 +34,9 @@ import config as cfg
 # ── 1. 調教分類ロジック ────────────────────────────────────────────────────
 
 def classify_training(l2: float, l1: float) -> str:
-    """ラスト2F(l2)とラスト1F(l1)から A3/A2/A1/B3/B2/B1 を返す。"""
-    if l1 < l2:  # 加速
+    """ラスト2F(l2)とラスト1F(l1)から A3/A2/A1/B3/B2/B1 を返す。
+    L1<=L2（終いが前区間と同等以上に速い）を加速とみなす（同タイムも加速）。"""
+    if l1 <= l2:  # 加速（同タイム含む）
         if l1 < 12.0:
             return "A3"
         elif 12.0 <= l2 < 13.0 and 12.0 <= l1 < 13.0:
@@ -1051,7 +1052,7 @@ def analyze(rows: list[dict]) -> list[dict]:
             l2  = _lap(hc0.get("lap_time_2f"))
             is_sakuji_accel = (
                 l1 is not None and l2 is not None and
-                11.0 <= l1 <= 11.9 and l1 < l2
+                11.0 <= l1 <= 11.9 and l1 <= l2
             )
 
             # 条件3: 出走間隔が中10週以内（84日未満）
@@ -1560,7 +1561,7 @@ def _hc_detail(rec: dict) -> dict | None:
         "t4f": _tg(rec.get("time_gokei_4f")),
         "l4": l4, "l3": l3, "l2": l2, "l1": l1,
         "rank": classify_training(l2, l1),
-        "accel": l1 < l2,
+        "accel": l1 <= l2,
     }
 
 
@@ -1577,7 +1578,7 @@ def _wc_detail(rec: dict) -> dict | None:
         "t4f": _tg(rec.get("time_gokei_4f")),
         "l2": l2, "l1": l1,
         "rank": (classify_training(l2, l1) if (l2 and l1) else None),
-        "accel": (l1 < l2 if (l2 and l1) else False),
+        "accel": (l1 <= l2 if (l2 and l1) else False),
     }
 
 
@@ -1807,8 +1808,14 @@ def _class_str(shubetsu_code, joken_code) -> str:
     return age + cls
 
 
-def _course_info_str(track_code, kyori) -> str:
-    """track_code・距離 → 'ダ1600m・右回り（外回り）' 形式の表示文字列。"""
+# 芝に内回り/外回りの区別がある競馬場（新潟・中山・京都・阪神）。
+# 東京・中京・函館・札幌・福島・小倉は1周コースのため内外表記しない。
+_NAIGAI_VENUES = {"04", "06", "08", "09"}
+
+
+def _course_info_str(track_code, kyori, keibajo_code=None) -> str:
+    """track_code・距離 → 'ダ1600m・右回り（外回り）' 形式の表示文字列。
+    内外回りは _NAIGAI_VENUES の競馬場のみ表記する。"""
     tt = _track_type(track_code)            # 芝 / ダート / 障害扱い
     info = _TRACK_INFO.get(str(track_code or "").strip())
     parts = []
@@ -1827,7 +1834,7 @@ def _course_info_str(track_code, kyori) -> str:
             s += "・直線"
         elif mawari:
             s += f"・{mawari}回り"
-        if naigai:
+        if naigai and str(keibajo_code or "").strip() in _NAIGAI_VENUES:
             s += f"（{naigai}回り）"
     return s
 
@@ -2423,6 +2430,7 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
         _course_str = _course_info_str(
             horses[0].get("race_track_code") if horses else None,
             horses[0].get("race_kyori") if horses else None,
+            keibajo,
         )
         # 特別名(kyosomei)が無い条件戦はクラス名(3歳以上1勝クラス等)を表示
         _race_name = kyosomei.strip() if kyosomei else ""
