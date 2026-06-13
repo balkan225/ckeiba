@@ -1605,13 +1605,74 @@ def fetch_pedigree(rows: list[dict]) -> None:
                         "fuku_ret": (r["fuku_pay"] or 0) / (n * 100),
                     }
 
-            # ③ 各馬に付与
+            # ④ 父詳細：馬場別（芝/ダ × 良/やや重/重〜不良）・クッション別（芝のみ）
+            detail: dict[str, dict] = {}
+            if chichi_set:
+                cl = list(chichi_set)
+                ph_c = ", ".join(["%s"] * len(cl))
+                _c1234 = ("SUM(CASE WHEN se.kakutei_chakujun='01' THEN 1 ELSE 0 END) c1,"
+                          "SUM(CASE WHEN se.kakutei_chakujun='02' THEN 1 ELSE 0 END) c2,"
+                          "SUM(CASE WHEN se.kakutei_chakujun='03' THEN 1 ELSE 0 END) c3,"
+                          "SUM(CASE WHEN se.kakutei_chakujun NOT IN ('01','02','03') THEN 1 ELSE 0 END) c4")
+
+                # 馬場別（芝ダ別、良/やや重/重〜不良）
+                cur.execute(f"""
+                    SELECT um.ketto_joho_01a chichi,
+                      CASE WHEN ra.track_code::int BETWEEN 10 AND 22 THEN 'T' ELSE 'D' END tt,
+                      CASE (CASE WHEN ra.track_code::int BETWEEN 10 AND 22
+                                 THEN ra.babajotai_code_shiba ELSE ra.babajotai_code_dirt END)
+                           WHEN '1' THEN 'G' WHEN '2' THEN 'Y'
+                           WHEN '3' THEN 'B' WHEN '4' THEN 'B' END baba,
+                      {_c1234}
+                    FROM jvd_se se
+                    JOIN jvd_um um ON um.ketto_toroku_bango=se.ketto_toroku_bango
+                    JOIN jvd_ra ra ON ra.kaisai_nen=se.kaisai_nen AND ra.kaisai_tsukihi=se.kaisai_tsukihi
+                      AND ra.keibajo_code=se.keibajo_code AND ra.race_bango=se.race_bango
+                    WHERE um.ketto_joho_01a IN ({ph_c})
+                      AND ra.track_code ~ '^[0-9]+$' AND ra.track_code::int BETWEEN 10 AND 29
+                      AND se.kakutei_chakujun ~ '^[0-9]+$' AND se.kakutei_chakujun<>'00'
+                      AND (CASE WHEN ra.track_code::int BETWEEN 10 AND 22
+                                THEN ra.babajotai_code_shiba ELSE ra.babajotai_code_dirt END) IN ('1','2','3','4')
+                    GROUP BY chichi, tt, baba
+                """, cl)
+                for r in cur.fetchall():
+                    d = detail.setdefault(r["chichi"], {"baba": {}, "cushion": {}})
+                    d["baba"].setdefault(r["tt"], {})[r["baba"]] = (r["c1"], r["c2"], r["c3"], r["c4"])
+
+                # クッション値別（芝のみ）
+                cur.execute(f"""
+                    SELECT um.ketto_joho_01a chichi,
+                      CASE WHEN cv.cushion_value>=10.5 THEN 'A'
+                           WHEN cv.cushion_value>=9.5 THEN 'B'
+                           WHEN cv.cushion_value>=8.5 THEN 'C' ELSE 'D' END band,
+                      {_c1234}
+                    FROM jvd_se se
+                    JOIN jvd_um um ON um.ketto_toroku_bango=se.ketto_toroku_bango
+                    JOIN jvd_ra ra ON ra.kaisai_nen=se.kaisai_nen AND ra.kaisai_tsukihi=se.kaisai_tsukihi
+                      AND ra.keibajo_code=se.keibajo_code AND ra.race_bango=se.race_bango
+                    JOIN cushion_values cv ON cv.racecourse = CASE ra.keibajo_code
+                        WHEN '01' THEN '札幌' WHEN '02' THEN '函館' WHEN '03' THEN '福島'
+                        WHEN '04' THEN '新潟' WHEN '05' THEN '東京' WHEN '06' THEN '中山'
+                        WHEN '07' THEN '中京' WHEN '08' THEN '京都' WHEN '09' THEN '阪神'
+                        WHEN '10' THEN '小倉' END
+                      AND cv.measured_date = to_date(ra.kaisai_nen||ra.kaisai_tsukihi,'YYYYMMDD')
+                    WHERE um.ketto_joho_01a IN ({ph_c})
+                      AND ra.track_code ~ '^[0-9]+$' AND ra.track_code::int BETWEEN 10 AND 22
+                      AND se.kakutei_chakujun ~ '^[0-9]+$' AND se.kakutei_chakujun<>'00'
+                    GROUP BY chichi, band
+                """, cl)
+                for r in cur.fetchall():
+                    d = detail.setdefault(r["chichi"], {"baba": {}, "cushion": {}})
+                    d["cushion"][r["band"]] = (r["c1"], r["c2"], r["c3"], r["c4"])
+
+            # ⑤ 各馬に付与
             for r in rows:
                 p = ped.get(r["ketto_toroku_bango"], {})
                 r["pedigree"] = p
                 key = (p.get("chichi_no"), r["keibajo_code"],
                        str(r.get("race_kyori") or "").strip())
                 r["chichi_stat"] = stat.get(key)
+                r["chichi_detail"] = detail.get(p.get("chichi_no"))
     finally:
         conn.close()
     print(f"  血統成績: {len(rows)}頭分")
@@ -2572,15 +2633,61 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
                              '該当データなし</td>'
                              '<td style="text-align:center;color:#bbb">―</td>')
 
+            # 父詳細（馬場別・クッション別）アコーディオン
+            cd = h.get("chichi_detail")
+            pd_uid = f"pd_{id(h)}"
+            chichi_cell = ped.get("chichi", "-")
+            detail_row = ""
+            if cd and (cd.get("baba") or cd.get("cushion")):
+                def _rec(t):
+                    return f"{t[0]}-{t[1]}-{t[2]}-{t[3]}" if t else "0-0-0-0"
+                baba = cd.get("baba", {})
+                cush = cd.get("cushion", {})
+
+                def _baba_block(tt, label):
+                    b = baba.get(tt)
+                    if not b:
+                        return ""
+                    rows_ = "".join(
+                        f'<tr><td style="padding:2px 10px;color:#555">{nm}</td>'
+                        f'<td style="padding:2px 10px;font-family:monospace">{_rec(b.get(k))}</td></tr>'
+                        for k, nm in [("G", "良"), ("Y", "やや重"), ("B", "重〜不良")] if b.get(k)
+                    )
+                    return (f'<div style="display:inline-block;vertical-align:top;margin-right:24px">'
+                            f'<div style="font-weight:bold;color:#1a5276;margin-bottom:2px">馬場別（{label}）</div>'
+                            f'<table style="font-size:.85em">{rows_}</table></div>')
+
+                cush_rows = "".join(
+                    f'<tr><td style="padding:2px 10px;color:#555">{nm}</td>'
+                    f'<td style="padding:2px 10px;font-family:monospace">{_rec(cush.get(k))}</td></tr>'
+                    for k, nm in [("A", "10.5以上"), ("B", "9.5-10.4"),
+                                  ("C", "8.5-9.4"), ("D", "8.4以下")] if cush.get(k)
+                )
+                cush_block = (
+                    f'<div style="display:inline-block;vertical-align:top">'
+                    f'<div style="font-weight:bold;color:#1a5276;margin-bottom:2px">クッション値別（芝）</div>'
+                    f'<table style="font-size:.85em">{cush_rows}</table></div>'
+                    if cush_rows else "")
+
+                detail_inner = (_baba_block("T", "芝") + _baba_block("D", "ダート") + cush_block)
+                detail_row = (
+                    f'<tr id="{pd_uid}" style="display:none">'
+                    f'<td colspan="10" style="background:#f9f9fb;padding:8px 14px">'
+                    f'<div style="font-size:.78em;color:#999;margin-bottom:4px">'
+                    f'父 {chichi_cell} 産駒の全成績（1着-2着-3着-着外）</div>'
+                    f'{detail_inner}</td></tr>\n')
+                chichi_cell = (f'<span style="cursor:pointer;color:#1565c0;text-decoration:underline" '
+                               f'onclick="toggleDetail(\'{pd_uid}\')">{ped.get("chichi","-")} ▼</span>')
+
             ped_html += (
                 f'<tr class="horse-sep">'
                 f'<td class="horse-name">{_np_s}{h["bamei"]}'
                 f'<br><span class="trainer-name">{h["trainer"]}</span></td>'
-                f'<td style="font-size:.86em">{ped.get("chichi","-")}</td>'
+                f'<td style="font-size:.86em">{chichi_cell}</td>'
                 f'<td style="font-size:.82em;color:#555">{ped.get("haha","-")}</td>'
                 f'<td style="font-size:.86em">{ped.get("bofu","-")}</td>'
                 + stat_cell +
-                f'</tr>\n'
+                f'</tr>\n' + detail_row
             )
 
         # スコア降順でカードを並べる
@@ -3155,6 +3262,12 @@ function toggleSenso(uid) {{
     const arrow = mainRow.querySelector('td:last-child');
     if (arrow) arrow.textContent = isOpen ? '▶ 詳細' : '▲ 閉じる';
   }}
+}}
+
+function toggleDetail(uid) {{
+  const detail = document.getElementById(uid);
+  if (!detail) return;
+  detail.style.display = (detail.style.display !== 'none') ? 'none' : '';
 }}
 
 function init() {{
