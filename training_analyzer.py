@@ -231,7 +231,8 @@ def fetch_data() -> tuple[list[dict], str]:
             cur.execute("""
                 SELECT kaisai_nen, kaisai_tsukihi, keibajo_code, race_bango,
                        kyori, track_code, tenko_code,
-                       babajotai_code_shiba, babajotai_code_dirt
+                       babajotai_code_shiba, babajotai_code_dirt,
+                       kyoso_shubetsu_code, kyoso_joken_code
                 FROM jvd_ra
                 WHERE (kaisai_nen || kaisai_tsukihi) BETWEEN %s AND %s
             """, [today_str, until_str])
@@ -247,6 +248,8 @@ def fetch_data() -> tuple[list[dict], str]:
                 e["race_track_code"]        = ra.get("track_code")
                 e["race_babajotai_shiba"]   = ra.get("babajotai_code_shiba")
                 e["race_babajotai_dirt"]    = ra.get("babajotai_code_dirt")
+                e["race_shubetsu_code"]     = ra.get("kyoso_shubetsu_code")
+                e["race_joken_code"]        = ra.get("kyoso_joken_code")
                 # tenko は jvd_se JOIN で既に取得しているが jvd_ra からも補完
                 if not e.get("tenko_code"):
                     e["tenko_code"] = ra.get("tenko_code")
@@ -1732,6 +1735,25 @@ _TRACK_INFO = {
 }
 
 
+# 競走種別（年齢条件）/ 競走条件（クラス）コード → 表示名
+_SHUBETSU_NAME = {
+    "11": "2歳", "12": "3歳", "13": "3歳以上", "14": "4歳以上",
+    "18": "障害", "19": "障害",
+}
+_JOKEN_NAME = {
+    "701": "新馬", "702": "未出走", "703": "未勝利",
+    "005": "1勝クラス", "010": "2勝クラス", "016": "3勝クラス",
+    "999": "オープン",
+}
+
+
+def _class_str(shubetsu_code, joken_code) -> str:
+    """競走種別・条件コード → '3歳以上1勝クラス' 形式。条件戦の表示用。"""
+    age = _SHUBETSU_NAME.get(str(shubetsu_code or "").strip(), "")
+    cls = _JOKEN_NAME.get(str(joken_code or "").strip(), "")
+    return age + cls
+
+
 def _course_info_str(track_code, kyori) -> str:
     """track_code・距離 → 'ダ1600m・右回り（外回り）' 形式の表示文字列。"""
     tt = _track_type(track_code)            # 芝 / ダート / 障害扱い
@@ -2349,11 +2371,16 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
             horses[0].get("race_track_code") if horses else None,
             horses[0].get("race_kyori") if horses else None,
         )
+        # 特別名(kyosomei)が無い条件戦はクラス名(3歳以上1勝クラス等)を表示
+        _race_name = kyosomei.strip() if kyosomei else ""
+        if not _race_name and horses:
+            _race_name = _class_str(horses[0].get("race_shubetsu_code"),
+                                    horses[0].get("race_joken_code"))
         _course_html = (f'<p class="course-info">{_course_str}</p>'
                         if _course_str else "")
         sections_html += f"""
         <section data-date="{race_date}" data-venue="{keibajo}" data-race="{race_no:02d}" style="display:none">
-          <h2>{race_date}　{venue_name}　{race_no}R　{kyosomei}</h2>
+          <h2>{race_date}　{venue_name}　{race_no}R　{_race_name}</h2>
           {_course_html}
           <p class="sub">調教取得期間: {cutoff_fmt}（前週土曜）〜 レース前日　／　選択基準: 4F最速タイム</p>
           <div class="tab-bar">
