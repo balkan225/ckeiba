@@ -1046,16 +1046,16 @@ def analyze(rows: list[dict]) -> list[dict]:
             cj0 = str(past0.get("chakujun", "")).strip().lstrip("0")
             is_first = (cj0 == "1")
 
-            # 条件2: 前走坂路 11秒台加速ラップ（L1が11.0〜11.9秒 かつ L1 < L2）
+            # 条件2: 前走坂路 加速ラップ（L1<=L2）。終い1Fで該当/惜しいを判定
+            #   11.0〜11.9秒 → 該当 / 12.0〜12.3秒（11秒台まで0.4秒以下）→ 惜しい
             hc0 = past0.get("hc", {})
             l1  = _lap(hc0.get("lap_time_1f"))
             l2  = _lap(hc0.get("lap_time_2f"))
-            is_sakuji_accel = (
-                l1 is not None and l2 is not None and
-                11.0 <= l1 <= 11.9 and l1 <= l2
-            )
+            is_accel = (l1 is not None and l2 is not None and l1 <= l2)
+            is_sakuji_accel = is_accel and (11.0 <= l1 <= 11.9)
+            is_oshii        = is_accel and (11.9 < l1 <= 12.3)
 
-            # 条件3: 出走間隔が中10週以内（84日未満）
+            # 条件3: 出走間隔が中12週以内（91日以内）
             try:
                 def _to_date(s):
                     return date(int(s[:4]), int(s[4:6]), int(s[6:]))
@@ -1066,7 +1066,7 @@ def analyze(rows: list[dict]) -> list[dict]:
             except Exception:
                 is_interval_ok = False
 
-            if is_first and is_sakuji_accel and is_interval_ok:
+            if is_first and is_interval_ok and is_sakuji_accel:
                 bw_diff = r.get("bataiju_diff")
                 if bw_diff is None:
                     nagori_flag = "?"     # 体重未発表（当日再チェック）
@@ -1074,6 +1074,10 @@ def analyze(rows: list[dict]) -> list[dict]:
                     nagori_flag = "A"     # 最推奨: 体重±0 or 増加
                 else:
                     nagori_flag = "B"     # 推奨: 体重減
+            elif is_first and is_interval_ok and is_oshii:
+                # 惜しい（終い1Fが11秒台まで0.4秒以下）
+                nagori_flag = "惜"
+                r["nagori_oshii_l1"] = l1
 
         r["nagori_flag"] = nagori_flag
 
@@ -2406,6 +2410,16 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
                     '<span style="background:#888;color:#fff;font-weight:bold;'
                     'border-radius:4px;padding:2px 8px;font-size:.9em" '
                     'title="なごり11秒加速・体重未確定（当日再確認）">○?</span></td>'
+                )
+            elif nf == "惜":
+                _ol1 = h.get("nagori_oshii_l1")
+                _otip = (f"惜しい：前走坂路の終い{_ol1:.1f}秒（11秒台まで{_ol1-11.9:.1f}秒）"
+                         if _ol1 else "惜しい：終い12秒台前半の加速ラップ")
+                nagori_cell = (
+                    f'<td style="text-align:center">'
+                    f'<span style="background:#b0a000;color:#fff;font-weight:bold;'
+                    f'border-radius:4px;padding:2px 7px;font-size:.85em" '
+                    f'title="{_otip}">惜</span></td>'
                 )
             else:
                 nagori_cell = '<td style="text-align:center;color:#ccc">-</td>'
