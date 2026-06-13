@@ -1556,19 +1556,35 @@ def fetch_pedigree(rows: list[dict]) -> None:
                         "bofu":   (r["ketto_joho_05b"] or "").strip(),
                     }
 
-            # ② 父 × 今回(競馬場×距離) の成績を一括集計（単複回収率込み）
+            # 集計対象期間: 過去10年
+            start_year = str(date.today().year - 10)
+
+            # ② 父 × 今回(競馬場×芝ダ×距離) の成績（過去10年・単複回収率込み）
             chichi_set = {p["chichi_no"] for p in ped.values() if p["chichi_no"]}
-            race_set = {(r["keibajo_code"], str(r.get("race_kyori") or "").strip())
-                        for r in rows if r.get("race_kyori")}
+            # race_set: (keibajo, kyori, tt)  tt='T'=芝 / 'D'=ダート
+            race_set = set()
+            for r in rows:
+                if not r.get("race_kyori"):
+                    continue
+                _tt = _track_type(r.get("race_track_code"))
+                ttc = "T" if _tt == "芝" else ("D" if _tt == "ダート" else None)
+                if ttc:
+                    race_set.add((r["keibajo_code"], str(r["race_kyori"]).strip(), ttc))
             stat: dict[tuple, dict] = {}
             if chichi_set and race_set:
                 cl = list(chichi_set)
                 rl = list(race_set)
                 ph_c = ", ".join(["%s"] * len(cl))
-                race_cond = " OR ".join(["(ra.keibajo_code=%s AND ra.kyori=%s)"] * len(rl))
-                params = cl + [x for pair in rl for x in pair]
+                conds, race_params = [], []
+                for (jo, ky, ttc) in rl:
+                    rng = "10 AND 22" if ttc == "T" else "23 AND 29"
+                    conds.append(f"(ra.keibajo_code=%s AND ra.kyori=%s AND ra.track_code::int BETWEEN {rng})")
+                    race_params += [jo, ky]
+                race_cond = " OR ".join(conds)
+                params = cl + race_params + [start_year]
                 cur.execute(f"""
                     SELECT um.ketto_joho_01a AS chichi, ra.keibajo_code, ra.kyori,
+                      CASE WHEN ra.track_code::int BETWEEN 10 AND 22 THEN 'T' ELSE 'D' END AS tt,
                       COUNT(*) AS n,
                       SUM(CASE WHEN se.kakutei_chakujun='01' THEN 1 ELSE 0 END) AS win,
                       SUM(CASE WHEN se.kakutei_chakujun IN ('01','02','03') THEN 1 ELSE 0 END) AS fuku,
@@ -1591,13 +1607,14 @@ def fetch_pedigree(rows: list[dict]) -> None:
                       AND hr.keibajo_code=se.keibajo_code AND hr.race_bango=se.race_bango
                     WHERE um.ketto_joho_01a IN ({ph_c}) AND ({race_cond})
                       AND se.kakutei_chakujun ~ '^[0-9]+$' AND se.kakutei_chakujun<>'00'
-                    GROUP BY um.ketto_joho_01a, ra.keibajo_code, ra.kyori
+                      AND se.kaisai_nen >= %s
+                    GROUP BY um.ketto_joho_01a, ra.keibajo_code, ra.kyori, tt
                 """, params)
                 for r in cur.fetchall():
                     n = r["n"] or 0
                     if n == 0:
                         continue
-                    stat[(r["chichi"], r["keibajo_code"], str(r["kyori"]).strip())] = {
+                    stat[(r["chichi"], r["keibajo_code"], str(r["kyori"]).strip(), r["tt"])] = {
                         "n": n, "win": r["win"], "fuku": r["fuku"],
                         "win_rate": r["win"] / n,
                         "fuku_rate": r["fuku"] / n,
@@ -1631,10 +1648,11 @@ def fetch_pedigree(rows: list[dict]) -> None:
                     WHERE um.ketto_joho_01a IN ({ph_c})
                       AND ra.track_code ~ '^[0-9]+$' AND ra.track_code::int BETWEEN 10 AND 29
                       AND se.kakutei_chakujun ~ '^[0-9]+$' AND se.kakutei_chakujun<>'00'
+                      AND se.kaisai_nen >= %s
                       AND (CASE WHEN ra.track_code::int BETWEEN 10 AND 22
                                 THEN ra.babajotai_code_shiba ELSE ra.babajotai_code_dirt END) IN ('1','2','3','4')
                     GROUP BY chichi, tt, baba
-                """, cl)
+                """, cl + [start_year])
                 for r in cur.fetchall():
                     d = detail.setdefault(r["chichi"], {"baba": {}, "cushion": {}})
                     d["baba"].setdefault(r["tt"], {})[r["baba"]] = (r["c1"], r["c2"], r["c3"], r["c4"])
@@ -1659,8 +1677,9 @@ def fetch_pedigree(rows: list[dict]) -> None:
                     WHERE um.ketto_joho_01a IN ({ph_c})
                       AND ra.track_code ~ '^[0-9]+$' AND ra.track_code::int BETWEEN 10 AND 22
                       AND se.kakutei_chakujun ~ '^[0-9]+$' AND se.kakutei_chakujun<>'00'
+                      AND se.kaisai_nen >= %s
                     GROUP BY chichi, band
-                """, cl)
+                """, cl + [start_year])
                 for r in cur.fetchall():
                     d = detail.setdefault(r["chichi"], {"baba": {}, "cushion": {}})
                     d["cushion"][r["band"]] = (r["c1"], r["c2"], r["c3"], r["c4"])
@@ -1669,8 +1688,10 @@ def fetch_pedigree(rows: list[dict]) -> None:
             for r in rows:
                 p = ped.get(r["ketto_toroku_bango"], {})
                 r["pedigree"] = p
+                _tt = _track_type(r.get("race_track_code"))
+                ttc = "T" if _tt == "芝" else ("D" if _tt == "ダート" else "")
                 key = (p.get("chichi_no"), r["keibajo_code"],
-                       str(r.get("race_kyori") or "").strip())
+                       str(r.get("race_kyori") or "").strip(), ttc)
                 r["chichi_stat"] = stat.get(key)
                 r["chichi_detail"] = detail.get(p.get("chichi_no"))
     finally:
@@ -2640,7 +2661,17 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
             detail_row = ""
             if cd and (cd.get("baba") or cd.get("cushion")):
                 def _rec(t):
-                    return f"{t[0]}-{t[1]}-{t[2]}-{t[3]}" if t else "0-0-0-0"
+                    if not t:
+                        return "0-0-0-0"
+                    c1, c2, c3, c4 = t
+                    tot = c1 + c2 + c3 + c4
+                    base = f"{c1}-{c2}-{c3}-{c4}"
+                    if tot == 0:
+                        return base
+                    wr = 100 * c1 / tot
+                    fr = 100 * (c1 + c2 + c3) / tot
+                    return (f'{base}<span style="color:#888;font-size:.9em">'
+                            f'（勝率{wr:.0f}% 複勝率{fr:.0f}%）</span>')
                 baba = cd.get("baba", {})
                 cush = cd.get("cushion", {})
 
