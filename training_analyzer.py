@@ -1017,7 +1017,7 @@ def analyze(rows: list[dict]) -> list[dict]:
         r["bataiju_trend"] = trend
 
         # 天候・馬場状態
-        _TENKO = {"1": "晴", "2": "曇", "3": "雨", "4": "雪", "5": "霙"}
+        _TENKO = {"1": "晴", "2": "曇", "3": "小雨", "4": "雨", "5": "小雪", "6": "雪"}
         tenko = str(r.get("tenko_code") or "").strip()
         r["tenko_fmt"] = _TENKO.get(tenko, "-")
         r["baba_shiba_fmt"] = _BABA_MAP.get(str(r.get("race_babajotai_shiba") or "").strip(), "-")
