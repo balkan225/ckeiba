@@ -20,18 +20,23 @@
 
 ```
 1. PostgreSQL 15+ をインストール（user=postgres）
-2. Python 3.12+ をインストール
+2. Python 3.12+ (64bit) をインストール … メイン処理用
+   ＋ Python (32bit) もインストール … JV-Link COM直叩き用(馬体重/天候のフォールバック)
 3. Git をインストール
 4. JRA-VAN Data Lab + JV-Link をインストール・認証
-5. PC-KEIBA DATABASE をインストール・DB設定
-6. JvLink To Importer をインストール（オッズ用）
+5. PC-KEIBA DATABASE をインストール・DB設定（pckeiba DB）
+6. JvLink To Importer をインストール（keibadata DB: オッズ・馬体重・天候）
 ```
 
 ## STEP 2: Pythonパッケージ
 
 ```bash
+# 64bit Python（メイン）
 pip install psycopg2 requests beautifulsoup4 sqlalchemy pandas
+# 32bit Python（JV-Link用、馬体重/天候のフォールバックに必須）
+<32bit-python> -m pip install pywin32
 ```
+※ JV-Link COMは32bit。64bit Pythonからは「クラスが登録されていません」で叩けない。
 
 ## STEP 3: データベース準備
 
