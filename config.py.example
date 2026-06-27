@@ -34,3 +34,7 @@ DATA_SOURCE = "auto"
 
 # レポート閲覧パスワード（HTML上のログイン画面用）
 VIEW_PASSWORD = "＜閲覧パスワードを設定＞"
+
+# Gemini API キー（各馬の言語化用。最終評価タブ）。
+# Google AI Studio (aistudio.google.com) で発行。pip install google-genai
+GEMINI_API_KEY = "＜Gemini APIキーを設定＞"

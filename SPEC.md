@@ -17,11 +17,12 @@ GitHub Pagesで公開するシステム。土日のレース当日は10分おき
 
 ---
 
-## 1. レポートの8タブ
+## 1. レポートの9タブ
 
 | タブ | 内容 |
 |------|------|
 | 📅 当日情報 | 馬体重(増減)・体重推移3走・オッズ・人気・**なごり11秒**判定。上部に天候/芝馬場/ダ馬場/クッション値 |
+| 🎯 最終評価 | **減点方式**で本命選定。印◎○▲△・減点・有利/不安・**Gemini総評**(重要点を太字)。減点が少ない順に並ぶ。降級バッジ |
 | 🏋 調教 | 坂路/ウッドのタイム・ラップ・評価(A3〜B1)。過去5走の調教も表示。馬名横に**調教師買いパターン**マーク |
 | 🌱 クッション | クッション値適性・過去10走のCV戦績 |
 | 🏇 コース適性 | 距離別/芝ダ別/馬場別/競馬場別の成績(★=今回条件) |
@@ -47,6 +48,7 @@ GitHub Pagesで公開するシステム。土日のレース当日は10分おき
 | B | PostgreSQL `keibadata` | JvLinkToImporter | 速報系: オッズ時系列・馬体重・天候馬場 |
 | C | クッション値 | cushion/fetch_live_data.py | JRAサイトから取得 |
 | D | JV-Link COM直叩き | 32bit Python | B が止まった時の**フォールバック**(馬体重・天候馬場) |
+| E | Gemini API | google-genai | 各馬の総評を自然言語化(最終評価タブ) |
 
 ### training_analyzer.py 処理順（__main__）
 ```
@@ -59,8 +61,13 @@ fetch_live_odds()       ⑥keibadataから最新オッズ・人気
 fetch_trainer_data()    ⑦時系列調教＋馬齢/騎手/レース条件(対象厩舎のみ)
 judge_trainer()         ⑧調教師買いパターン判定(trainer_rules.py)
 fetch_pedigree()        ⑨血統成績(父×競馬場×芝ダ×距離、過去10年)
-generate_html()         ⑩8タブHTML生成(パスワード保護込み)
-push_to_github()        ⑪commit & push
+fetch_jockey_stats()    ⑩騎手成績(全体/競馬場/距離帯複勝率)＋負担重量
+build_horse_profile()   ⑪言語化用プロファイル統合(コース相関/距離±200m/クラス適性)
+calc_demerit/assign_marks ⑫減点評価＋印付与
+generate_comments()     ⑬[--comment時のみ]Gemini総評生成→comments.jsonキャッシュ
+  / load_comments()       [通常]キャッシュ読込
+generate_html()         ⑭9タブHTML生成(パスワード保護込み)
+push_to_github()        ⑮commit & push
 ```
 
 ---
@@ -136,6 +143,30 @@ L2=ラスト2F, L1=ラスト1F
   - 適性: ◎=複勝率35%↑or回収率110%↑(10戦以上) / ○ / △ / ―(少)
 - 父詳細(クリック展開): 馬場別(芝/ダ×良/やや重/重〜不良)・クッション値別(芝、4帯)＋勝率複勝率
 
+### 最終評価（最終評価タブ）— 減点方式＋AI言語化
+減点0スタートで不安要素ごとに減点。**減点が少ない順**に ◎○▲△(レース内ランキング)。
+- `build_horse_profile()`: 言語化用データ集約
+  - コース適性: 今回コース＋**近いコース**(`_COURSE_SIMILAR` 相関マップ、内外区別)
+  - 距離±200m / 馬場別 / クラス適性(昇級・降級・同級＋当該クラス戦績)
+- `fetch_jockey_stats()`: 騎手の全体/競馬場/距離帯複勝率＋負担重量(同レース平均比)
+- `calc_demerit()` 減点ルール(調教は対象外):
+  - コース実績なし-2 / 近いコースのみ-1
+  - 距離±200m複勝なし-2
+  - 昇級戦×当該クラス実績なし-2 / 同級×複勝なし-1（降級は減点せず有利材料）
+  - 斤量 平均比+2.0kg以上-1
+  - 騎手 全体複勝率15%未満-1 / 当該場10%未満-1
+  - 血統 コース適性複勝率20%未満-1
+- `generate_comments()`: **Gemini API**(gemini-2.5-flash)でレース単位バッチ言語化
+  - 重要点を `**…**`(→HTML太字)で強調。データにない推測は禁止
+  - **フル更新(--comment)時のみ生成** → `comments.json` にキャッシュ
+  - quick更新は `load_comments()` で読込(Geminiコールなし)
+  - APIキー: `config.GEMINI_API_KEY`(AI Studio発行)。`pip install google-genai`
+
+### コース相関マップ（コース形態ベース・内外区別）
+`_COURSE_NAME`((競馬場,track_code)→コース名) と `_COURSE_SIMILAR`(コース名→近いコース)。
+東京/中京/新潟外=左回り瞬発、阪神外/京都外=右回り瞬発、中山/阪神内/京都内=右回りパワー、
+札幌/函館/福島/小倉/新潟内=小回り先行。「今回コース実績なければ近いコース実績」に使用。
+
 ### 馬体重・天候馬場のJV-Linkフォールバック（重要）
 JvLinkImporterが止まると keibadata が空になる。その場合:
 - `fetch_live_weight` → `jvlink/fetch_weight_jvlink.py`(32bit) で `JVRTOpen("0B12")`→SEレコード
@@ -152,15 +183,16 @@ JvLinkImporterが止まると keibadata が空になる。その場合:
 
 ```
 C:\Users\balka\Desktop\Ckeiba\
-├── training_analyzer.py    ★メイン(約3300行)
+├── training_analyzer.py    ★メイン(約3800行)
 ├── trainer_rules.py        ★調教師判定エンジン(27調教師)
-├── config.py               DB接続・パスワード(非公開・gitignore)
+├── config.py               DB接続・各パスワード・Gemini APIキー(非公開・gitignore)
 ├── config.py.example       設定テンプレート
 ├── report.html             生成物(GitHub管理)
+├── comments.json           Gemini総評キャッシュ(非公開・gitignore、フル更新で再生成)
 │
 ├── レポート生成.bat         ダブルクリックでtraining_analyzer.py実行
-├── update_all.ps1          フル更新(PC-KEIBA＋クッション＋レポート)
-├── update_quick.ps1        頻繁更新(レポートのみ)
+├── update_all.ps1          フル更新(PC-KEIBA＋クッション＋レポート＋--comment言語化)
+├── update_quick.ps1        頻繁更新(レポートのみ、総評はキャッシュ読込)
 ├── run_pckeiba_update.ps1  PC-KEIBA DATABASE のUI自動操作
 ├── inspect_pckeiba.ps1     PC-KEIBA UI構造調査(デバッグ)
 │
@@ -207,7 +239,8 @@ C:\Users\balka\Desktop\Ckeiba\
 | keibadata DB | localhost:5432 / postgres / pw=＜config.py＞ |
 | Python(64bit) | C:\Users\balka\AppData\Local\Python\bin\python.exe |
 | Python(32bit) | C:\Users\balka\AppData\Local\Programs\Python\Python314-32\python.exe (JV-Link用) |
-| 必要パッケージ | psycopg2, requests, beautifulsoup4, sqlalchemy, pandas, pywin32(32bit側) |
+| 必要パッケージ | psycopg2, requests, beautifulsoup4, sqlalchemy, pandas, google-genai, pywin32(32bit側) |
+| Gemini APIキー | `config.GEMINI_API_KEY`(AI Studio発行)。モデル=gemini-2.5-flash |
 | cmdのコードページ | UTF-8(65001)。.batはUTF-8保存・chcp行なし |
 
 ---
@@ -239,6 +272,9 @@ python training_analyzer.py
 | 血統「該当データなし」 | 過去10年×今回(競馬場×芝ダ×距離)に該当なし。サンプル不足 |
 | なごり0頭 | 条件(11秒台かつ前走1着)が厳しく通常少数。正常 |
 | 調教師判定が出ない | 当週追い切り(水木)実施前は保留。木金以降に判定 |
+| 総評(最終評価)が空 | comments.json未生成。フル更新(`--comment`)で生成。quick更新は読込のみ |
+| Gemini 429 RESOURCE_EXHAUSTED | 無料枠/レート超過。gemini-2.5-flash使用(2.0-flashは枠小)。生成にsleep+リトライ実装済 |
+| Geminiが推測を書く | プロンプトで「データにない情報は触れない」指示済。崩れたら強化 |
 | JV-Link "クラスが登録されていません" | 64bitで実行している。32bit Pythonを使う |
 | JV-Link gen_pyエラー | dynamic.Dispatch使用済。再発時は %LOCALAPPDATA%\Temp\gen_py 削除 |
 | .bat日本語が文字化け | cmdは65001。.batをUTF-8保存(chcp行なし)。Shift-JIS保存はNG |
