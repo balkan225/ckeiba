@@ -1918,6 +1918,88 @@ def build_horse_profile(rows: list[dict]) -> None:
         }
 
 
+# ── 3h. 減点方式の最終評価 ─────────────────────────────────────────────────
+
+def calc_demerit(h: dict) -> None:
+    """減点方式で各馬を評価。減点が少ない（0に近い）ほど高評価。
+    調教は対象外。降級は減点せず有利材料(merit)に記録。
+    r["demerit"]（負の合計）, r["demerit_list"], r["merit_list"] を付与。
+    """
+    p = h.get("profile") or {}
+    j = h.get("jockey")
+    cs = h.get("chichi_stat")
+    pts = 0
+    dem = []   # 減点理由
+    mer = []   # 有利材料
+
+    def _fuku3(t):
+        return t and (t[0] + t[1] + t[2]) > 0
+
+    # コース適性
+    self_ok = _fuku3(p.get("course_self"))
+    near_ok = any(_fuku3(s) for _, s in (p.get("course_near") or []))
+    if not self_ok and not near_ok:
+        pts -= 2; dem.append("コース実績なし(-2)")
+    elif not self_ok and near_ok:
+        pts -= 1; dem.append("今回コース未経験・近いコースのみ(-1)")
+    elif self_ok:
+        mer.append(f"{p.get('course_name','')}実績あり")
+
+    # 距離±200m
+    ds = p.get("dist_self")
+    if ds is not None and sum(ds) > 0 and not _fuku3(ds):
+        pts -= 2; dem.append("距離±200mで複勝なし(-2)")
+    elif _fuku3(ds):
+        mer.append("距離適性あり")
+
+    # クラス
+    move = p.get("class_move")
+    csl = p.get("class_self")
+    if move == "昇級":
+        if csl is not None and not _fuku3(csl):
+            pts -= 2; dem.append("昇級戦・当該クラス実績なし(-2)")
+    elif move == "同級":
+        if csl is not None and sum(csl) > 0 and not _fuku3(csl):
+            pts -= 1; dem.append("当該クラスで複勝なし(-1)")
+    elif move == "降級":
+        mer.append("降級(格上経験あり)")
+
+    # 斤量
+    fd = h.get("futan_diff")
+    if fd is not None and fd >= 2.0:
+        pts -= 1; dem.append(f"斤量 平均比+{fd}kg(-1)")
+
+    # 騎手
+    if j:
+        if j["all"][1] is not None and j["all"][1] < 15:
+            pts -= 1; dem.append(f"騎手 全体複勝率{j['all'][1]}%(-1)")
+        if j["venue"][1] is not None and j["venue"][0] >= 10 and j["venue"][1] < 10:
+            pts -= 1; dem.append(f"騎手 当該場複勝率{j['venue'][1]}%(-1)")
+
+    # 血統（今回コース適性）
+    if cs and cs["n"] >= 10 and cs["fuku_rate"] * 100 < 20:
+        pts -= 1; dem.append(f"血統 コース適性 複勝率{round(cs['fuku_rate']*100)}%(-1)")
+
+    h["demerit"] = pts
+    h["demerit_list"] = dem
+    h["merit_list"] = mer
+
+
+def assign_marks(rows: list[dict]) -> None:
+    """レース単位で減点が少ない順に印(◎○▲△)を付与。r["mark"] に格納。"""
+    from collections import defaultdict
+    races = defaultdict(list)
+    for r in rows:
+        if r.get("demerit") is not None:
+            races[(r["race_date_str"], r["keibajo_code"], r["race_bango"])].append(r)
+    marks = ["◎", "○", "▲", "△", "△"]
+    for race_horses in races.values():
+        # 減点が少ない順（0に近い順）。同点は馬番順
+        ordered = sorted(race_horses, key=lambda r: (-r["demerit"], r.get("umaban") or "99"))
+        for i, r in enumerate(ordered):
+            r["mark"] = marks[i] if i < len(marks) else ""
+
+
 # ── 3d. 調教師別 買いパターン判定 ──────────────────────────────────────────
 # データ基準: 坂路タイム=4F(time_gokei_4f), ウッドF明記なし=5F(time_gokei_5f)
 #            ラップ分類は classify_training (A1〜B3) を流用
@@ -3644,6 +3726,10 @@ if __name__ == "__main__":
         print("騎手成績・評価プロファイル集計中...")
         fetch_jockey_stats(results)
         build_horse_profile(results)
+        print("減点評価・印付与中...")
+        for h in results:
+            calc_demerit(h)
+        assign_marks(results)
         out = str(Path(__file__).parent / "report.html")
         generate_html(results, out, data_source=source)
         push_to_github(out)
