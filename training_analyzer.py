@@ -1699,6 +1699,202 @@ def fetch_pedigree(rows: list[dict]) -> None:
     print(f"  血統成績: {len(rows)}頭分")
 
 
+# ── 3f. 騎手成績・負担重量 ─────────────────────────────────────────────────
+
+def fetch_jockey_stats(rows: list[dict]) -> None:
+    """
+    各馬に騎手成績（全体/今回競馬場/今回距離±200mの複勝率）と、
+    負担重量（斤量・同レース平均との差）を付与する。過去10年。
+    - r["jockey"] = {name, all:(n,rate), venue:(n,rate), dist:(n,rate)}
+    - r["futan"], r["futan_diff"]（同レース平均比, +は重い）
+    """
+    if not rows:
+        return
+    try:
+        conn = psycopg2.connect(**cfg.DB_CONFIG)
+    except Exception as e:
+        print(f"  [騎手DB接続エラー: {e}]")
+        return
+
+    from collections import defaultdict
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # ① 今回レースの kishu_code, futan_juryo を一括取得
+            kettos = list({r["ketto_toroku_bango"] for r in rows})
+            entry = {}  # (ketto, race_date, keibajo, race) → (kishu_code, kishu_name, futan)
+            for i in range(0, len(kettos), 1000):
+                chunk = kettos[i:i + 1000]
+                ph = ", ".join(["%s"] * len(chunk))
+                cur.execute(f"""
+                    SELECT DISTINCT ON (ketto_toroku_bango, kaisai_nen, kaisai_tsukihi, keibajo_code, race_bango)
+                        ketto_toroku_bango, kaisai_nen, kaisai_tsukihi, keibajo_code, race_bango,
+                        kishu_code, kishumei_ryakusho, futan_juryo
+                    FROM jvd_se
+                    WHERE ketto_toroku_bango IN ({ph})
+                      AND data_kubun IN ('1','2','7','9')
+                    ORDER BY ketto_toroku_bango, kaisai_nen, kaisai_tsukihi, keibajo_code, race_bango, data_kubun DESC
+                """, chunk)
+                for x in cur.fetchall():
+                    key = (x["ketto_toroku_bango"], x["kaisai_nen"] + x["kaisai_tsukihi"],
+                           x["keibajo_code"], x["race_bango"])
+                    entry[key] = (x.get("kishu_code"), (x.get("kishumei_ryakusho") or "").strip(),
+                                  x.get("futan_juryo"))
+
+            # 各馬に kishu/futan を仮付与
+            jockey_set = set()
+            for r in rows:
+                key = (r["ketto_toroku_bango"], r["race_date_str"],
+                       r["keibajo_code"], r["race_bango"])
+                kc, kn, fu = entry.get(key, (None, "", None))
+                r["_kishu_code"] = kc
+                r["_kishu_name"] = kn
+                try:
+                    r["futan"] = int(str(fu).strip()) / 10 if fu and str(fu).strip().isdigit() else None
+                except (ValueError, TypeError):
+                    r["futan"] = None
+                if kc and str(kc).strip() not in ("", "00000"):
+                    jockey_set.add(kc)
+
+            # ② 騎手成績を一括集計（騎手×競馬場×距離、過去10年）
+            jstat = defaultdict(lambda: defaultdict(lambda: [0, 0]))  # kc → key → [n, fuku]
+            if jockey_set:
+                jl = list(jockey_set)
+                ph_j = ", ".join(["%s"] * len(jl))
+                cur.execute(f"""
+                    SELECT se.kishu_code kc, se.keibajo_code jo, ra.kyori::int kyori,
+                      COUNT(*) n,
+                      SUM(CASE WHEN se.kakutei_chakujun IN ('01','02','03') THEN 1 ELSE 0 END) fuku
+                    FROM jvd_se se
+                    JOIN jvd_ra ra ON ra.kaisai_nen=se.kaisai_nen AND ra.kaisai_tsukihi=se.kaisai_tsukihi
+                      AND ra.keibajo_code=se.keibajo_code AND ra.race_bango=se.race_bango
+                    WHERE se.kishu_code IN ({ph_j}) AND se.kaisai_nen>='2016'
+                      AND se.kakutei_chakujun ~ '^[0-9]+$' AND se.kakutei_chakujun<>'00'
+                      AND ra.kyori ~ '^[0-9]+$' AND ra.track_code::int BETWEEN 10 AND 29
+                    GROUP BY se.kishu_code, se.keibajo_code, ra.kyori
+                """, jl)
+                raw = cur.fetchall()
+                for x in raw:
+                    kc = x["kc"]
+                    jstat[kc]["all"][0] += x["n"]; jstat[kc]["all"][1] += x["fuku"]
+                    jstat[kc][("v", x["jo"])][0] += x["n"]; jstat[kc][("v", x["jo"])][1] += x["fuku"]
+                    jstat[kc][("k", x["kyori"])][0] += x["n"]; jstat[kc][("k", x["kyori"])][1] += x["fuku"]
+
+            # ③ 各馬に騎手成績を付与（今回競馬場・距離±200m）
+            def _rate(t):
+                return (t[0], round(t[1] / t[0] * 100)) if t[0] else (0, None)
+            for r in rows:
+                kc = r.get("_kishu_code")
+                if not kc or kc not in jstat:
+                    r["jockey"] = None
+                    continue
+                js = jstat[kc]
+                # 距離±200m
+                try:
+                    ky = int(str(r.get("race_kyori") or "").strip())
+                except (ValueError, TypeError):
+                    ky = None
+                d_n = d_f = 0
+                if ky:
+                    for kk, t in js.items():
+                        if isinstance(kk, tuple) and kk[0] == "k" and abs(kk[1] - ky) <= 200:
+                            d_n += t[0]; d_f += t[1]
+                r["jockey"] = {
+                    "name": r.get("_kishu_name", ""),
+                    "all":   _rate(js["all"]),
+                    "venue": _rate(js.get(("v", r["keibajo_code"]), [0, 0])),
+                    "dist":  _rate([d_n, d_f]),
+                }
+
+            # ④ 斤量：同レース平均との差
+            race_futan = defaultdict(list)
+            for r in rows:
+                if r.get("futan"):
+                    race_futan[(r["race_date_str"], r["keibajo_code"], r["race_bango"])].append(r["futan"])
+            for r in rows:
+                key = (r["race_date_str"], r["keibajo_code"], r["race_bango"])
+                fl = race_futan.get(key, [])
+                if r.get("futan") and len(fl) >= 2:
+                    avg = sum(fl) / len(fl)
+                    r["futan_diff"] = round(r["futan"] - avg, 1)
+                else:
+                    r["futan_diff"] = None
+    finally:
+        conn.close()
+    print(f"  騎手成績・斤量: {len(rows)}頭分")
+
+
+# ── 3g. 言語化用 評価プロファイル統合 ──────────────────────────────────────
+
+def build_horse_profile(rows: list[dict]) -> None:
+    """
+    各馬の言語化用データを r["profile"] に統合する（既存データの整形が主）。
+    - course_name: 今回コース名（内外区別）
+    - course_self: 今回コースの戦績 (1,2,3,着外)
+    - course_near: 近いコースの戦績 [(コース名,(1,2,3,着外)), ...]
+    - dist_self:   今回距離±200mの戦績
+    - training_now: 今回の坂路/ウッド評価
+    - training_good: 過去3着内時の坂路評価リスト（今回との比較材料）
+    ※ jockey/futan は fetch_jockey_stats、血統は fetch_pedigree で別途付与済み
+    """
+    from collections import defaultdict
+
+    def _cj(v):
+        try:
+            return int(str(v or "99").strip().lstrip("0") or "99")
+        except (ValueError, TypeError):
+            return 99
+
+    for r in rows:
+        hist = r.get("course_history", [])
+
+        # コース名別の戦績
+        cstat = defaultdict(lambda: [0, 0, 0, 0])
+        for h in hist:
+            cn = _course_name(h.get("keibajo_code"), h.get("track_code"))
+            if not cn:
+                continue
+            c = _cj(h.get("kakutei_chakujun"))
+            cstat[cn][c - 1 if c <= 3 else 3] += 1
+
+        cur_course = _course_name(r["keibajo_code"], r.get("race_track_code"))
+        course_self = tuple(cstat[cur_course]) if cur_course in cstat else None
+        course_near = [(nc, tuple(cstat[nc]))
+                       for nc in _similar_courses(cur_course or "") if nc in cstat]
+
+        # 距離±200m
+        try:
+            ky = int(str(r.get("race_kyori") or "").strip())
+        except (ValueError, TypeError):
+            ky = None
+        dstat = [0, 0, 0, 0]
+        if ky:
+            for h in hist:
+                try:
+                    hk = int(str(h.get("kyori") or "").strip())
+                except (ValueError, TypeError):
+                    continue
+                if abs(hk - ky) <= 200:
+                    c = _cj(h.get("kakutei_chakujun"))
+                    dstat[c - 1 if c <= 3 else 3] += 1
+
+        # 調教：過去3着内時の坂路評価
+        good_tr = []
+        for pa in r.get("past_races_analyzed", []):
+            c = _cj(pa.get("chakujun"))
+            if c <= 3 and pa.get("hc_rank") not in (None, "", "調教なし"):
+                good_tr.append(pa["hc_rank"])
+
+        r["profile"] = {
+            "course_name":  cur_course,
+            "course_self":  course_self,
+            "course_near":  course_near,
+            "dist_self":    tuple(dstat),
+            "dist_kyori":   ky,
+            "training_now": {"hc": r.get("rank"), "wc": r.get("wc_rank")},
+            "training_good": good_tr,
+        }
+
+
 # ── 3d. 調教師別 買いパターン判定 ──────────────────────────────────────────
 # データ基準: 坂路タイム=4F(time_gokei_4f), ウッドF明記なし=5F(time_gokei_5f)
 #            ラップ分類は classify_training (A1〜B3) を流用
@@ -3416,6 +3612,9 @@ if __name__ == "__main__":
             h["trainer_flag"] = judge_trainer(h)
         print("血統成績集計中...")
         fetch_pedigree(results)
+        print("騎手成績・評価プロファイル集計中...")
+        fetch_jockey_stats(results)
+        build_horse_profile(results)
         out = str(Path(__file__).parent / "report.html")
         generate_html(results, out, data_source=source)
         push_to_github(out)
