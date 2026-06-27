@@ -274,7 +274,8 @@ def fetch_data() -> tuple[list[dict], str]:
                        t.keibajo_code, t.race_bango, t.kakutei_chakujun,
                        t.kyakushitsu_hantei, t.wakuban, t.bataiju,
                        ra.kyori, ra.track_code,
-                       ra.babajotai_code_shiba, ra.babajotai_code_dirt
+                       ra.babajotai_code_shiba, ra.babajotai_code_dirt,
+                       ra.kyoso_joken_code, ra.kyoso_shubetsu_code
                 FROM (
                     SELECT ketto_toroku_bango, kaisai_nen, kaisai_tsukihi,
                            keibajo_code, race_bango, kakutei_chakujun,
@@ -433,6 +434,7 @@ def fetch_data() -> tuple[list[dict], str]:
                         "wc": past_wc_map.get((ketto, rd), {}),
                         "cushion":       _cv(pr["keibajo_code"], rd),
                         "bataiju":       (pr.get("bataiju") or "").strip(),
+                        "joken_code":    (pr.get("kyoso_joken_code") or "").strip(),
                     })
 
                 # 直近10走分のクッション情報を収集（表示 + 好走評価に使用）
@@ -1884,6 +1886,24 @@ def build_horse_profile(rows: list[dict]) -> None:
             if c <= 3 and pa.get("hc_rank") not in (None, "", "調教なし"):
                 good_tr.append(pa["hc_rank"])
 
+        # クラス適性：昇級/降級/同級 ＋ 今回クラスでの戦績
+        now_jk = str(r.get("race_joken_code") or "").strip()
+        now_lv = _CLASS_LEVEL.get(now_jk)
+        pr_list = r.get("past_races") or []
+        shoukyu = None
+        if now_lv is not None and pr_list:
+            prev_jk = str(pr_list[0].get("joken_code") or "").strip()
+            prev_lv = _CLASS_LEVEL.get(prev_jk)
+            if prev_lv is not None:
+                shoukyu = ("昇級" if now_lv > prev_lv
+                           else "降級" if now_lv < prev_lv else "同級")
+        # 今回クラスでの過去戦績
+        same_class = [0, 0, 0, 0]
+        for pr in pr_list:
+            if str(pr.get("joken_code") or "").strip() == now_jk and now_jk:
+                c = _cj(pr.get("chakujun"))
+                same_class[c - 1 if c <= 3 else 3] += 1
+
         r["profile"] = {
             "course_name":  cur_course,
             "course_self":  course_self,
@@ -1892,6 +1912,9 @@ def build_horse_profile(rows: list[dict]) -> None:
             "dist_kyori":   ky,
             "training_now": {"hc": r.get("rank"), "wc": r.get("wc_rank")},
             "training_good": good_tr,
+            "class_now":    _JOKEN_NAME.get(now_jk, ""),
+            "class_move":   shoukyu,
+            "class_self":   tuple(same_class),
         }
 
 
@@ -2180,6 +2203,12 @@ _JOKEN_NAME = {
     "701": "新馬", "702": "未出走", "703": "未勝利",
     "005": "1勝クラス", "010": "2勝クラス", "016": "3勝クラス",
     "999": "オープン",
+}
+
+# クラスのレベル（昇級/降級判定用）。新馬・未勝利=0 < 1勝 < 2勝 < 3勝 < オープン
+_CLASS_LEVEL = {
+    "701": 0, "702": 0, "703": 0,
+    "005": 1, "010": 2, "016": 3, "999": 4,
 }
 
 
