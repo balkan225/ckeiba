@@ -1,4 +1,4 @@
-﻿$python  = "C:\Users\balka\AppData\Local\Python\bin\python.exe"
+$python  = "C:\Users\balka\AppData\Local\Python\bin\python.exe"
 $ckeiba  = "C:\Users\balka\Desktop\Ckeiba"
 $logFile = "$ckeiba\update_all.log"
 
@@ -27,7 +27,7 @@ if ($LASTEXITCODE -ne 0) { Log "[WARN] Cushion update had issues (continuing)" }
 # [3/3] レポート生成
 Log "[3/3] Report generation + GitHub push..."
 Set-Location $ckeiba
-$out2 = & $python training_analyzer.py 2>&1
+$out2 = & $python training_analyzer.py --comment 2>&1
 $out2 | ForEach-Object { Add-Content $logFile $_ }
 $code = $LASTEXITCODE
 

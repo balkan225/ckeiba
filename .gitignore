@@ -43,3 +43,4 @@ jvlink/_*.py
 __pycache__/
 cushion/__pycache__/
 jvlink/__pycache__/
+comments.json

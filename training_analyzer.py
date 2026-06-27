@@ -2000,6 +2000,119 @@ def assign_marks(rows: list[dict]) -> None:
             r["mark"] = marks[i] if i < len(marks) else ""
 
 
+# ── 3i. Gemini言語化（各馬総評） ───────────────────────────────────────────
+_COMMENTS_PATH = str(Path(__file__).parent / "comments.json")
+_GEMINI_MODEL = "gemini-2.5-flash"
+
+
+def _profile_text(h: dict) -> str:
+    """1頭の評価データをプロンプト用テキストに整形。"""
+    p = h.get("profile") or {}
+    j = h.get("jockey")
+    cs = h.get("chichi_stat")
+
+    def fmt(t):
+        return f"{t[0]}-{t[1]}-{t[2]}-{t[3]}" if t else "-"
+
+    ub = str(h.get("umaban") or "").strip().lstrip("0") or "?"
+    near = "/".join(f"{n}{fmt(s)}" for n, s in (p.get("course_near") or [])) or "なし"
+    jl = (f"{j['name']}(全体複勝{j['all'][1]}%/当該場{j['venue'][1]}%/距離帯{j['dist'][1]}%)"
+          if j else "不明")
+    chi = (f"父{(h.get('pedigree') or {}).get('chichi','')}"
+           f"(コース適性複勝{round(cs['fuku_rate']*100)}%)" if cs else "")
+    return (
+        f"{ub}番 {h['bamei'].strip()}[減点{h.get('demerit')}]\n"
+        f"  コース{p.get('course_name','')}:{fmt(p.get('course_self'))} 近いコース:{near}\n"
+        f"  距離±200m({p.get('dist_kyori')}m):{fmt(p.get('dist_self'))} "
+        f"クラス:{p.get('class_now')}[{p.get('class_move')}]当該{fmt(p.get('class_self'))}\n"
+        f"  斤量平均比{h.get('futan_diff')}kg 騎手:{jl} {chi}\n"
+        f"  有利:{','.join(h.get('merit_list') or []) or 'なし'} "
+        f"不安:{','.join(h.get('demerit_list') or []) or 'なし'}"
+    )
+
+
+def generate_comments(rows: list[dict]) -> None:
+    """Gemini で各馬の総評を生成し、r["comment"] と comments.json に保存。
+    レース単位でまとめて1コール（コール数削減）。フル更新時のみ呼ぶ想定。"""
+    import json, time, re
+    try:
+        from google import genai
+        client = genai.Client(api_key=cfg.GEMINI_API_KEY)
+    except Exception as e:
+        print(f"  [Gemini初期化エラー: {e}]")
+        return
+
+    from collections import defaultdict
+    races = defaultdict(list)
+    for r in rows:
+        if r.get("demerit") is not None:
+            races[(r["race_date_str"], r["keibajo_code"], r["race_bango"])].append(r)
+
+    comments = {}
+    n_done = 0
+    for key, hs in races.items():
+        ordered = sorted(hs, key=lambda r: (-r["demerit"], r.get("umaban") or "99"))
+        body = "\n".join(_profile_text(h) for h in ordered)
+        prompt = (
+            "あなたは競馬予想の専門家です。以下の出走馬それぞれについて、買い材料と不安材料を"
+            "1〜2文で簡潔に総評してください。\n"
+            "- です・ます調\n"
+            "- 重要なポイントは **二重アスタリスクで囲んで** 強調\n"
+            "- 降級馬は『格上経験』を有利材料として触れる\n"
+            "- 与えられたデータにない情報（騎手の継続騎乗・前走比較・馬体など）は"
+            "推測せず触れないこと\n"
+            "- 出力は必ず各行『馬番|総評』の形式（馬番は半角数字、区切りは縦棒）\n\n"
+            f"{body}"
+        )
+        text = ""
+        for attempt in range(3):
+            try:
+                resp = client.models.generate_content(model=_GEMINI_MODEL, contents=prompt)
+                text = resp.text or ""
+                break
+            except Exception as e:
+                if "429" in str(e) or "RESOURCE" in str(e):
+                    time.sleep(8)
+                else:
+                    print(f"  [Gemini生成エラー: {str(e)[:80]}]")
+                    break
+        # パース（馬番|総評）
+        by_uma = {}
+        for line in text.splitlines():
+            m = re.match(r"\s*\*?\*?(\d{1,2})\s*[|｜:：]\s*(.+)", line.strip())
+            if m:
+                by_uma[int(m.group(1))] = m.group(2).strip()
+        for h in ordered:
+            try:
+                ub = int(str(h.get("umaban") or "0").strip())
+            except (ValueError, TypeError):
+                ub = 0
+            cm = by_uma.get(ub, "")
+            h["comment"] = cm
+            comments[h["ketto_toroku_bango"]] = cm
+        n_done += 1
+        time.sleep(0.5)   # レート制限緩和
+
+    try:
+        with open(_COMMENTS_PATH, "w", encoding="utf-8") as f:
+            json.dump(comments, f, ensure_ascii=False)
+    except Exception as e:
+        print(f"  [comments.json保存エラー: {e}]")
+    print(f"  Gemini総評生成: {n_done}レース / {len(comments)}頭")
+
+
+def load_comments(rows: list[dict]) -> None:
+    """comments.json から総評を読み込んで r["comment"] に付与（quick更新用）。"""
+    import json
+    try:
+        with open(_COMMENTS_PATH, encoding="utf-8") as f:
+            comments = json.load(f)
+    except Exception:
+        comments = {}
+    for r in rows:
+        r["comment"] = comments.get(r["ketto_toroku_bango"], "")
+
+
 # ── 3d. 調教師別 買いパターン判定 ──────────────────────────────────────────
 # データ基準: 坂路タイム=4F(time_gokei_4f), ウッドF明記なし=5F(time_gokei_5f)
 #            ラップ分類は classify_training (A1〜B3) を流用
@@ -2474,6 +2587,7 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
         ai_cards       = []
         today_html     = ""   # 当日情報タブ
         ped_html       = ""   # 血統タブ
+        final_cards    = []   # 最終評価タブ（減点順ソート用）
 
         def _umaban_key(h):
             try:
@@ -2892,6 +3006,39 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
             )
             ai_cards.append((sc["total"], card_html))
 
+            # ── 最終評価タブ: 1行（減点順） ───────────────────────────
+            import re as _re
+            mk = h.get("mark", "")
+            mk_color = {"◎": "#c0392b", "○": "#e67e00", "▲": "#1565c0", "△": "#888"}.get(mk, "#bbb")
+            dem_pts = h.get("demerit")
+            merit_s = "・".join(h.get("merit_list") or [])
+            demer_s = "・".join(h.get("demerit_list") or [])
+            cm = _re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>",
+                         (h.get("comment") or "").replace("<", "&lt;").replace(">", "&gt;")
+                         .replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>"))
+            move = (h.get("profile") or {}).get("class_move")
+            move_badge = ""
+            if move == "降級":
+                move_badge = ('<span style="background:#1a7a3a;color:#fff;border-radius:3px;'
+                              'padding:1px 6px;font-size:.72em;margin-left:4px">降級</span>')
+            elif move == "昇級":
+                move_badge = ('<span style="background:#999;color:#fff;border-radius:3px;'
+                              'padding:1px 6px;font-size:.72em;margin-left:4px">昇級</span>')
+            final_html_row = (
+                f'<tr class="horse-sep">'
+                f'<td style="text-align:center;font-size:1.3em;font-weight:bold;color:{mk_color}">{mk or "－"}</td>'
+                f'<td class="horse-name" style="min-width:110px">{_np_s}{h["bamei"]}{move_badge}'
+                f'<br><span class="trainer-name">{h["trainer"]}</span></td>'
+                f'<td style="text-align:center;font-weight:bold">{dem_pts}</td>'
+                f'<td style="font-size:.82em;line-height:1.6">'
+                f'<div style="color:#1a7a3a">{("◎ " + merit_s) if merit_s else ""}</div>'
+                f'<div style="color:#c0392b">{("▼ " + demer_s) if demer_s else ""}</div></td>'
+                f'<td style="font-size:.88em;line-height:1.7">{cm or "<span style=color:#bbb>―</span>"}</td>'
+                f'</tr>\n'
+            )
+            final_cards.append((dem_pts if dem_pts is not None else -99,
+                                str(h.get("umaban") or "99"), final_html_row))
+
             # ── 当日情報タブ: 1行 ─────────────────────────────────────
             bw_diff = h.get("bataiju_diff")
             if bw_diff is not None:
@@ -3077,6 +3224,9 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
         # スコア降順でカードを並べる
         ai_cards.sort(key=lambda x: -x[0])
         ai_html = '<div class="ai-grid">' + "".join(c for _, c in ai_cards) + '</div>'
+        # 最終評価: 減点が少ない順（0に近い順）
+        final_cards.sort(key=lambda x: (-x[0], x[1]))
+        final_html = "".join(c for _, _, c in final_cards)
 
         _course_str = _course_info_str(
             horses[0].get("race_track_code") if horses else None,
@@ -3097,6 +3247,7 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
           <p class="sub">調教取得期間: {cutoff_fmt}（前週土曜）〜 レース前日　／　選択基準: 4F最速タイム</p>
           <div class="tab-bar">
             <button class="tab-btn active" onclick="switchTab(this,'today')">📅 当日情報</button>
+            <button class="tab-btn"        onclick="switchTab(this,'final')">🎯 最終評価</button>
             <button class="tab-btn"        onclick="switchTab(this,'training')">🏋 調教</button>
             <button class="tab-btn"        onclick="switchTab(this,'cushion')">🌱 クッション</button>
             <button class="tab-btn"        onclick="switchTab(this,'course')">🏇 コース適性</button>
@@ -3128,6 +3279,21 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
             <p style="font-size:.78em;color:#888;margin-top:8px">
               ※ 馬体重・オッズ・人気はレース当日（発走前）に反映されます。
             </p>
+          </div>
+          <div class="tab-pane" data-pane="final" style="display:none">
+            <p style="font-size:.78em;color:#888;margin:4px 0 10px">
+              ※ 減点方式（コース・距離・クラス・斤量・騎手・血統）。減点が少ない順に ◎○▲△。
+              総評は重要点を太字で強調。降級馬は緑バッジ表示。
+            </p>
+            <table>
+              <thead><tr>
+                <th style="width:40px">印</th><th>馬名</th>
+                <th style="width:50px">減点</th>
+                <th style="width:240px">有利／不安</th>
+                <th>総評</th>
+              </tr></thead>
+              <tbody>{final_html}</tbody>
+            </table>
           </div>
           <div class="tab-pane" data-pane="training" style="display:none">
             <table>
@@ -3730,6 +3896,13 @@ if __name__ == "__main__":
         for h in results:
             calc_demerit(h)
         assign_marks(results)
+        # 言語化: --comment 指定時のみGemini生成（フル更新）。通常はキャッシュ読込
+        import sys as _sys
+        if "--comment" in _sys.argv:
+            print("Gemini総評生成中...")
+            generate_comments(results)
+        else:
+            load_comments(results)
         out = str(Path(__file__).parent / "report.html")
         generate_html(results, out, data_source=source)
         push_to_github(out)
