@@ -19,6 +19,8 @@
 !update_quick.ps1
 !run_pckeiba_update.ps1
 !inspect_pckeiba.ps1
+!レポート生成.bat
+!総評生成.bat
 
 # サブプロジェクト
 !cushion/
