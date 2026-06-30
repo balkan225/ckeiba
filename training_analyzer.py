@@ -2026,6 +2026,7 @@ def _profile_text(h: dict) -> str:
         f"  距離±200m({p.get('dist_kyori')}m):{fmt(p.get('dist_self'))} "
         f"クラス:{p.get('class_now')}[{p.get('class_move')}]当該{fmt(p.get('class_self'))}\n"
         f"  斤量平均比{h.get('futan_diff')}kg 騎手:{jl} {chi}\n"
+        f"  今回調教:坂路{(p.get('training_now') or {}).get('hc')}/ウッド{(p.get('training_now') or {}).get('wc')}\n"
         f"  有利:{','.join(h.get('merit_list') or []) or 'なし'} "
         f"不安:{','.join(h.get('demerit_list') or []) or 'なし'}"
     )
@@ -2048,31 +2049,49 @@ def generate_comments(rows: list[dict]) -> None:
         if r.get("demerit") is not None:
             races[(r["race_date_str"], r["keibajo_code"], r["race_bango"])].append(r)
 
-    comments = {}
+    # 既存キャッシュをベースに読み込み、生成成功した馬だけ上書きする
+    # （途中でレート制限に当たっても前回分が消えないように）
+    try:
+        with open(_COMMENTS_PATH, encoding="utf-8") as f:
+            comments = json.load(f)
+    except Exception:
+        comments = {}
+
+    n_total = len(races)
     n_done = 0
-    for key, hs in races.items():
+    n_fail = 0
+    for ri, (key, hs) in enumerate(races.items(), 1):
         ordered = sorted(hs, key=lambda r: (-r["demerit"], r.get("umaban") or "99"))
         body = "\n".join(_profile_text(h) for h in ordered)
         prompt = (
-            "あなたは競馬予想の専門家です。以下の出走馬それぞれについて、買い材料と不安材料を"
-            "1〜2文で簡潔に総評してください。\n"
+            "あなたは競馬予想の専門家です。以下の出走馬それぞれについて、"
+            "3〜4文の読み応えのある総評を書いてください。\n"
+            "各馬について次の流れで述べること：\n"
+            "1. 最大の買い材料（コース適性・距離実績・騎手成績・血統適性・降級など）\n"
+            "2. 実績や安定感の補足\n"
+            "3. 不安材料（斤量・クラス昇級・調教不足など）\n"
+            "4. 「〜な一戦でしょう。」のように締めくくる結論\n"
+            "ルール：\n"
             "- です・ます調\n"
             "- 重要なポイントは **二重アスタリスクで囲んで** 強調\n"
-            "- 降級馬は『格上経験』を有利材料として触れる\n"
-            "- 与えられたデータにない情報（騎手の継続騎乗・前走比較・馬体など）は"
+            "- 数字（コース成績1-1-1-0、複勝率%など）は具体的に引用\n"
+            "- 降級馬（クラスが[降級]）は『格上経験』を有利材料として明確に触れる\n"
+            "- 与えられたデータにない情報（騎手の継続騎乗・前走比較・馬体重など）は"
             "推測せず触れないこと\n"
-            "- 出力は必ず各行『馬番|総評』の形式（馬番は半角数字、区切りは縦棒）\n\n"
+            "- 出力は必ず各行『馬番|総評』の形式（馬番は半角数字、区切りは縦棒"
+            "、総評内では改行しない）\n\n"
             f"{body}"
         )
         text = ""
-        for attempt in range(3):
+        for attempt in range(5):
             try:
                 resp = client.models.generate_content(model=_GEMINI_MODEL, contents=prompt)
                 text = resp.text or ""
                 break
             except Exception as e:
                 if "429" in str(e) or "RESOURCE" in str(e):
-                    time.sleep(8)
+                    # 指数バックオフ（15/30/45/60/75秒）
+                    time.sleep(15 * (attempt + 1))
                 else:
                     print(f"  [Gemini生成エラー: {str(e)[:80]}]")
                     break
@@ -2082,23 +2101,36 @@ def generate_comments(rows: list[dict]) -> None:
             m = re.match(r"\s*\*?\*?(\d{1,2})\s*[|｜:：]\s*(.+)", line.strip())
             if m:
                 by_uma[int(m.group(1))] = m.group(2).strip()
+        ok = bool(by_uma)
         for h in ordered:
             try:
                 ub = int(str(h.get("umaban") or "0").strip())
             except (ValueError, TypeError):
                 ub = 0
+            ket = h["ketto_toroku_bango"]
             cm = by_uma.get(ub, "")
-            h["comment"] = cm
-            comments[h["ketto_toroku_bango"]] = cm
-        n_done += 1
-        time.sleep(0.5)   # レート制限緩和
+            if cm:
+                h["comment"] = cm
+                comments[ket] = cm
+            else:
+                # 生成失敗時は前回値を保持
+                h["comment"] = comments.get(ket, "")
+        if ok:
+            n_done += 1
+        else:
+            n_fail += 1
+        # レースごとに都度保存（中断されても進捗が残るように）
+        try:
+            with open(_COMMENTS_PATH, "w", encoding="utf-8") as f:
+                json.dump(comments, f, ensure_ascii=False)
+        except Exception as e:
+            print(f"  [comments.json保存エラー: {e}]")
+        if ri % 10 == 0 or ri == n_total:
+            print(f"  進捗 {ri}/{n_total}レース（成功{n_done}/失敗{n_fail}）", flush=True)
+        # 無料枠のRPM制限（約10/分）に収まるよう1レースごとに待機
+        time.sleep(7)
 
-    try:
-        with open(_COMMENTS_PATH, "w", encoding="utf-8") as f:
-            json.dump(comments, f, ensure_ascii=False)
-    except Exception as e:
-        print(f"  [comments.json保存エラー: {e}]")
-    print(f"  Gemini総評生成: {n_done}レース / {len(comments)}頭")
+    print(f"  Gemini総評生成: 成功{n_done}/失敗{n_fail}レース / 総計{len(comments)}頭", flush=True)
 
 
 def load_comments(rows: list[dict]) -> None:
@@ -2113,7 +2145,161 @@ def load_comments(rows: list[dict]) -> None:
         r["comment"] = comments.get(r["ketto_toroku_bango"], "")
 
 
-# ── 3d. 調教師別 買いパターン判定 ──────────────────────────────────────────
+# ── 3d. 展開予想 ─────────────────────────────────────────────────────────────
+
+_STYLE_LABEL = {"逃げ": "逃", "先行": "先", "差し": "差", "追込": "追", "不明": "？"}
+_STYLE_COLOR = {
+    "逃げ": ("#fde8e8", "#c0392b"),
+    "先行": ("#fff3cd", "#856404"),
+    "差し": ("#d4edda", "#155724"),
+    "追込": ("#d0e8ff", "#0a3a7a"),
+    "不明": ("#f0f0f0", "#888"),
+}
+
+
+def fetch_running_style(rows: list[dict]) -> None:
+    """過去走のコーナー1角通過順位から各馬の脚質を判定し r['running_style'] 等を付与。"""
+    from collections import defaultdict
+
+    def _rate_to_style(rate: float) -> str:
+        if rate <= 0.15:
+            return "逃げ"
+        elif rate <= 0.40:
+            return "先行"
+        elif rate <= 0.65:
+            return "差し"
+        return "追込"
+
+    kettos = list({r["ketto_toroku_bango"] for r in rows})
+    if not kettos:
+        return
+    conn = psycopg2.connect(**cfg.DB_CONFIG)
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # C1が00の短距離コース（1200m等でC1・C2を通過しない）はC3を代用
+            # kaisai_nen+kaisai_tsukihi降順で直近順に取得
+            cur.execute("""
+                SELECT s.ketto_toroku_bango,
+                       s.kaisai_nen, s.kaisai_tsukihi,
+                       s.corner_1, s.corner_3,
+                       r.shusso_tosu
+                FROM jvd_se s
+                JOIN jvd_ra r ON (
+                    s.keibajo_code = r.keibajo_code
+                    AND s.kaisai_nen = r.kaisai_nen
+                    AND s.kaisai_tsukihi = r.kaisai_tsukihi
+                    AND s.race_bango = r.race_bango
+                )
+                WHERE s.ketto_toroku_bango = ANY(%s)
+                  AND s.data_kubun = '7'
+                  AND (s.corner_1 NOT IN ('', '00') OR s.corner_3 NOT IN ('', '00'))
+                  AND r.shusso_tosu NOT IN ('', '00', '0 ')
+                ORDER BY s.ketto_toroku_bango,
+                         s.kaisai_nen DESC, s.kaisai_tsukihi DESC
+            """, [kettos])
+            db_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    # 馬ごとに直近順のレートリストと直近4走の個別脚質を蓄積
+    style_data:   dict[str, list[float]] = defaultdict(list)
+    history_data: dict[str, list[str]]   = defaultdict(list)  # 直近4走の脚質ラベル
+
+    for row in db_rows:
+        ket = row["ketto_toroku_bango"]
+        try:
+            c1_raw = str(row["corner_1"]).strip()
+            c3_raw = str(row["corner_3"]).strip()
+            c_val  = c1_raw if (c1_raw and c1_raw != "00") else c3_raw
+            c      = int(c_val)
+            tosu   = int(str(row["shusso_tosu"]).strip())
+            if c > 0 and tosu > 0:
+                rate = c / tosu
+                style_data[ket].append(rate)
+                if len(history_data[ket]) < 4:
+                    history_data[ket].append(_rate_to_style(rate))
+        except (ValueError, TypeError):
+            pass
+
+    for r in rows:
+        ket   = r["ketto_toroku_bango"]
+        rates = style_data.get(ket, [])[:5]   # 直近5走で平均
+        hist  = history_data.get(ket, [])     # 直近4走の個別ラベル（新→旧順）
+        if not rates:
+            r["running_style"]  = "不明"
+            r["c1_avg_rate"]    = None
+            r["style_n"]        = 0
+            r["style_history"]  = []
+        else:
+            avg = sum(rates) / len(rates)
+            r["c1_avg_rate"]   = round(avg, 2)
+            r["style_n"]       = len(rates)
+            r["style_history"] = hist  # [前走, 2走前, 3走前, 4走前]
+            r["running_style"] = _rate_to_style(avg)
+
+    known = sum(1 for r in rows if r.get("running_style") != "不明")
+    print(f"  脚質判定: {known}/{len(rows)}頭")
+
+
+def fetch_course_pace_map(rows: list[dict]) -> dict:
+    """コース×距離の過去レースから前傾/後傾/イーブン傾向を取得。
+    戻り値: {(keibajo_code, kyori_str): {'tendency':str, 'front':float, 'back':float, 'n':int}}
+    """
+    keys = {(r["keibajo_code"], str(r.get("race_kyori") or ""))
+            for r in rows if r.get("race_kyori")}
+    result: dict[tuple, dict] = {}
+    if not keys:
+        return result
+    conn = psycopg2.connect(**cfg.DB_CONFIG)
+    try:
+        with conn.cursor() as cur:
+            for keibajo, kyori in keys:
+                cur.execute("""
+                    SELECT lap_time FROM jvd_ra
+                    WHERE keibajo_code = %s AND kyori = %s
+                      AND lap_time IS NOT NULL
+                      AND kaisai_nen >= '2023'
+                    ORDER BY kaisai_nen DESC, kaisai_tsukihi DESC
+                    LIMIT 30
+                """, [keibajo, kyori])
+                laps_all = []
+                for (lt,) in cur.fetchall():
+                    raw = (lt or "").strip()
+                    laps = [int(raw[i:i+3]) / 10
+                            for i in range(0, len(raw) - 2, 3)
+                            if raw[i:i+3].isdigit() and raw[i:i+3] != "000"]
+                    if len(laps) >= 4:
+                        laps_all.append(laps)
+                if not laps_all:
+                    continue
+                # ラップ数が同じレースに絞る
+                from collections import Counter
+                common_n = Counter(len(l) for l in laps_all).most_common(1)[0][0]
+                filtered = [l for l in laps_all if len(l) == common_n]
+                half = common_n // 2
+                front = sum(sum(l[:half]) for l in filtered) / len(filtered)
+                back  = sum(sum(l[half:]) for l in filtered) / len(filtered)
+                fpm   = front / half   # 200m平均（前半）
+                bpm   = back  / (common_n - half)  # 200m平均（後半）
+                diff  = fpm - bpm
+                if diff > 0.3:
+                    tendency = "前傾"    # 前半速い（差し有利）
+                elif diff < -0.3:
+                    tendency = "後傾"   # 後半速い（逃げ粘り）
+                else:
+                    tendency = "イーブン"
+                result[(keibajo, kyori)] = {
+                    "tendency": tendency,
+                    "front": round(front, 1),
+                    "back":  round(back, 1),
+                    "n":     len(filtered),
+                }
+    finally:
+        conn.close()
+    return result
+
+
+# ── 3e. 調教師別 買いパターン判定 ──────────────────────────────────────────
 # データ基準: 坂路タイム=4F(time_gokei_4f), ウッドF明記なし=5F(time_gokei_5f)
 #            ラップ分類は classify_training (A1〜B3) を流用
 #            併せ馬/単走/先着はDB非保持 → 判定不可（△＋注釈で対応）
@@ -2362,6 +2548,17 @@ def _badge(rank: str) -> str:
     )
 
 
+def _mini_badge(rank: str) -> str:
+    """最終評価タブ用の小型バッジ（坂路/ウッド区分の表示）。"""
+    if rank in (None, "", "-", "調教なし"):
+        return '<span style="color:#bbb">なし</span>'
+    bg, fg, _ = RANK_META.get(rank, ("#eee", "#333", rank))
+    return (
+        f'<span style="background:{bg};color:{fg};padding:1px 5px;'
+        f'border-radius:3px;font-weight:bold;font-size:.82em">{rank}</span>'
+    )
+
+
 def _f(v) -> str:
     return f"{v:.1f}" if v is not None else "-"
 
@@ -2523,7 +2720,8 @@ def _cv_label(cv) -> str:
     return "柔らかめ"
 
 
-def generate_html(results: list[dict], output_path: str = "report.html", data_source: str = "tk") -> None:
+def generate_html(results: list[dict], output_path: str = "report.html", data_source: str = "tk",
+                  course_pace_map: dict | None = None) -> None:
     today = date.today()
     source_disp = _SOURCE_DISP.get(data_source, data_source)
     _pw_hash_val = _pw_hash(_PW)
@@ -2588,6 +2786,7 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
         today_html     = ""   # 当日情報タブ
         ped_html       = ""   # 血統タブ
         final_cards    = []   # 最終評価タブ（減点順ソート用）
+        pace_html      = ""   # 展開予想タブ
 
         def _umaban_key(h):
             try:
@@ -3024,12 +3223,18 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
             elif move == "昇級":
                 move_badge = ('<span style="background:#999;color:#fff;border-radius:3px;'
                               'padding:1px 6px;font-size:.72em;margin-left:4px">昇級</span>')
+            _tn = (h.get("profile") or {}).get("training_now") or {}
+            training_cell = (
+                f'<div style="white-space:nowrap">坂路{_mini_badge(_tn.get("hc"))}</div>'
+                f'<div style="white-space:nowrap">ウッド{_mini_badge(_tn.get("wc"))}</div>'
+            )
             final_html_row = (
                 f'<tr class="horse-sep">'
                 f'<td style="text-align:center;font-size:1.3em;font-weight:bold;color:{mk_color}">{mk or "－"}</td>'
                 f'<td class="horse-name" style="min-width:110px">{_np_s}{h["bamei"]}{move_badge}'
                 f'<br><span class="trainer-name">{h["trainer"]}</span></td>'
                 f'<td style="text-align:center;font-weight:bold">{dem_pts}</td>'
+                f'<td style="font-size:.82em;line-height:1.5;text-align:center">{training_cell}</td>'
                 f'<td style="font-size:.82em;line-height:1.6">'
                 f'<div style="color:#1a7a3a">{("◎ " + merit_s) if merit_s else ""}</div>'
                 f'<div style="color:#c0392b">{("▼ " + demer_s) if demer_s else ""}</div></td>'
@@ -3228,6 +3433,147 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
         final_cards.sort(key=lambda x: (-x[0], x[1]))
         final_html = "".join(c for _, _, c in final_cards)
 
+        # ── 展開予想タブHTML ──────────────────────────────────────────
+        _kyori_str = str(horses[0].get("race_kyori") or "") if horses else ""
+        _pace_info = (course_pace_map or {}).get((keibajo, _kyori_str), {})
+        _tendency  = _pace_info.get("tendency", "")
+        _pace_n    = _pace_info.get("n", 0)
+
+        # 脚質ごとのカウント
+        style_counts = {"逃げ": 0, "先行": 0, "差し": 0, "追込": 0, "不明": 0}
+        for h in horses:
+            s = h.get("running_style", "不明")
+            style_counts[s] = style_counts.get(s, 0) + 1
+        n_nige = style_counts["逃げ"]
+
+        # ペース予測
+        if n_nige >= 3:
+            pace_pred, pace_bg, pace_fg = "ハイペース", "#c0392b", "#fff"
+            pace_note = "逃げ馬が多く前半から激しい争いが予想されます。差し・追込に有利。"
+        elif n_nige == 2:
+            pace_pred, pace_bg, pace_fg = "ミドルペース", "#e67e00", "#fff"
+            pace_note = "逃げ馬2頭。展開次第でペースが上がる可能性があります。"
+        elif n_nige == 1:
+            pace_pred, pace_bg, pace_fg = "スロー候補", "#1565c0", "#fff"
+            pace_note = "逃げ馬1頭。単騎逃げでスローになりやすく、先行馬が有利になりやすい展開です。"
+        else:
+            pace_pred, pace_bg, pace_fg = "逃げ馬不明", "#888", "#fff"
+            pace_note = "逃げ候補が判定できません。過去走データを確認してください。"
+
+        # コース傾向バッジ
+        tend_styles = {
+            "前傾": ("#fde8e8", "#c0392b", "前半が速いコース傾向（差し・追込に有利）"),
+            "後傾": ("#d4edda", "#155724", "後半が速いコース傾向（逃げ・先行が粘りやすい）"),
+            "イーブン": ("#f0f4ff", "#1565c0", "前後半のペースが均等なコース傾向"),
+        }
+        if _tendency and _pace_info:
+            tb, tf, tdesc = tend_styles.get(_tendency, ("#eee", "#333", ""))
+            tend_html = (
+                f'<span style="background:{tb};color:{tf};padding:3px 10px;'
+                f'border-radius:4px;font-weight:bold;font-size:.9em">{_tendency}</span>'
+                f'<span style="font-size:.8em;color:#666;margin-left:8px">{tdesc}'
+                f'（過去{_pace_n}レース集計）</span>'
+            )
+        else:
+            tend_html = '<span style="color:#bbb">データなし</span>'
+
+        # 脚質分布サマリーバー
+        total_h = len(horses) or 1
+        dist_bar = ""
+        for sname, scount in [("逃げ","逃げ"),("先行","先行"),("差し","差し"),("追込","追込"),("不明","不明")]:
+            cnt = style_counts[sname]
+            if cnt == 0:
+                continue
+            bg, fg = _STYLE_COLOR[sname]
+            pct = cnt / total_h * 100
+            dist_bar += (
+                f'<div style="display:inline-block;background:{bg};color:{fg};'
+                f'width:{pct:.0f}%;text-align:center;font-size:.8em;font-weight:bold;'
+                f'padding:3px 0;min-width:24px">{_STYLE_LABEL[sname]}{cnt}</div>'
+            )
+
+        # 馬ごとの行
+        style_rows = ""
+        for h in sorted(horses, key=_umaban_key):
+            sty  = h.get("running_style", "不明")
+            rate = h.get("c1_avg_rate")
+            n_s  = h.get("style_n", 0)
+            hist = h.get("style_history", [])  # [前走, 2走前, 3走前, 4走前]
+            bg, fg = _STYLE_COLOR[sty]
+            # 位置取りバー（1角平均順位を視覚化）
+            if rate is not None:
+                bar_pct = rate * 100
+                bar_html = (
+                    f'<div style="background:#eee;border-radius:3px;height:12px;width:100px;'
+                    f'display:inline-block;vertical-align:middle">'
+                    f'<div style="background:{fg};height:100%;border-radius:3px;'
+                    f'width:{bar_pct:.0f}%"></div></div>'
+                    f'<span style="font-size:.72em;color:#777;margin-left:4px">'
+                    f'avg {rate*100:.0f}%({n_s}走)</span>'
+                )
+            else:
+                bar_html = '<span style="color:#bbb;font-size:.8em">データなし</span>'
+            # 直近4走の個別脚質バッジ（前走を強調）
+            hist_html = ""
+            labels = ["前走", "2走前", "3走前", "4走前"]
+            for i, s in enumerate(hist):
+                hbg, hfg = _STYLE_COLOR[s]
+                is_senso = (i == 0)
+                border = f"outline:2px solid {hfg};" if is_senso else ""
+                label_tag = (f'<div style="font-size:.6em;color:{hfg};text-align:center;'
+                             f'margin-bottom:1px">{labels[i]}</div>') if is_senso else ""
+                hist_html += (
+                    f'<div style="display:inline-block;margin-right:3px;vertical-align:top">'
+                    f'{label_tag}'
+                    f'<span style="background:{hbg};color:{hfg};padding:1px 6px;'
+                    f'border-radius:3px;font-size:.82em;font-weight:bold;{border}">'
+                    f'{_STYLE_LABEL[s]}</span></div>'
+                )
+            if not hist_html:
+                hist_html = '<span style="color:#bbb;font-size:.8em">-</span>'
+            mk       = h.get("mark", "")
+            mk_color = {"◎": "#c0392b", "○": "#e67e00", "▲": "#1565c0", "△": "#888"}.get(mk, "#bbb")
+            style_rows += (
+                f'<tr>'
+                f'<td style="text-align:center;font-size:1.1em;font-weight:bold;color:{mk_color}">'
+                f'{mk or "－"}</td>'
+                f'<td class="horse-name">{h["bamei"]}</td>'
+                f'<td style="text-align:center">'
+                f'<span style="background:{bg};color:{fg};padding:2px 8px;border-radius:4px;'
+                f'font-weight:bold;font-size:.95em">{sty}</span>'
+                f'<div style="margin-top:2px">{bar_html}</div></td>'
+                f'<td style="padding:4px 8px">{hist_html}</td>'
+                f'</tr>\n'
+            )
+
+        pace_html = f"""
+        <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:14px;align-items:flex-start">
+          <div style="background:#f5f7fa;border-radius:8px;padding:12px 18px;flex:1;min-width:200px">
+            <div style="font-size:.78em;color:#888;margin-bottom:4px">ペース予測</div>
+            <span style="background:{pace_bg};color:{pace_fg};padding:4px 14px;border-radius:4px;
+              font-weight:bold;font-size:1.05em">{pace_pred}</span>
+            <div style="font-size:.8em;color:#555;margin-top:6px">{pace_note}</div>
+          </div>
+          <div style="background:#f5f7fa;border-radius:8px;padding:12px 18px;flex:1;min-width:200px">
+            <div style="font-size:.78em;color:#888;margin-bottom:4px">コースペース傾向</div>
+            {tend_html}
+          </div>
+          <div style="background:#f5f7fa;border-radius:8px;padding:12px 18px;flex:2;min-width:260px">
+            <div style="font-size:.78em;color:#888;margin-bottom:4px">脚質分布</div>
+            <div style="border-radius:4px;overflow:hidden">{dist_bar}</div>
+          </div>
+        </div>
+        <table>
+          <thead><tr>
+            <th style="width:40px">印</th>
+            <th>馬名</th>
+            <th style="width:110px">脚質（平均）</th>
+            <th style="width:160px">近走脚質（前走→4走前）</th>
+          </tr></thead>
+          <tbody>{style_rows}</tbody>
+        </table>
+        """
+
         _course_str = _course_info_str(
             horses[0].get("race_track_code") if horses else None,
             horses[0].get("race_kyori") if horses else None,
@@ -3248,6 +3594,7 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
           <div class="tab-bar">
             <button class="tab-btn active" onclick="switchTab(this,'today')">📅 当日情報</button>
             <button class="tab-btn"        onclick="switchTab(this,'final')">🎯 最終評価</button>
+            <button class="tab-btn"        onclick="switchTab(this,'pace')">🏃 展開</button>
             <button class="tab-btn"        onclick="switchTab(this,'training')">🏋 調教</button>
             <button class="tab-btn"        onclick="switchTab(this,'cushion')">🌱 クッション</button>
             <button class="tab-btn"        onclick="switchTab(this,'course')">🏇 コース適性</button>
@@ -3289,11 +3636,19 @@ def generate_html(results: list[dict], output_path: str = "report.html", data_so
               <thead><tr>
                 <th style="width:40px">印</th><th>馬名</th>
                 <th style="width:50px">減点</th>
+                <th style="width:70px">調教</th>
                 <th style="width:240px">有利／不安</th>
                 <th>総評</th>
               </tr></thead>
               <tbody>{final_html}</tbody>
             </table>
+          </div>
+          <div class="tab-pane" data-pane="pace" style="display:none">
+            <p style="font-size:.78em;color:#888;margin:4px 0 10px">
+              ※ 脚質は過去走の1角通過順位（直近5走）から自動判定。
+              ペース予測は逃げ馬の頭数から算出。コース傾向は過去3年の同コース・同距離ラップデータに基づきます。
+            </p>
+            {pace_html}
           </div>
           <div class="tab-pane" data-pane="training" style="display:none">
             <table>
@@ -3892,6 +4247,9 @@ if __name__ == "__main__":
         print("騎手成績・評価プロファイル集計中...")
         fetch_jockey_stats(results)
         build_horse_profile(results)
+        print("脚質判定中...")
+        fetch_running_style(results)
+        course_pace_map = fetch_course_pace_map(results)
         print("減点評価・印付与中...")
         for h in results:
             calc_demerit(h)
@@ -3904,7 +4262,7 @@ if __name__ == "__main__":
         else:
             load_comments(results)
         out = str(Path(__file__).parent / "report.html")
-        generate_html(results, out, data_source=source)
+        generate_html(results, out, data_source=source, course_pace_map=course_pace_map)
         push_to_github(out)
     else:
         print("対象レースが見つかりませんでした。")
